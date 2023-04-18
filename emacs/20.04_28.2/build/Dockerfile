@@ -44,7 +44,7 @@ ENV CXX=/usr/bin/gcc-10
 ENV CFLAGS="-O3"
 RUN cd ~/local/src/emacs-28.2 && \
     ./autogen.sh && \
-    ./configure --prefix=/root/local --with-native-compilation --with-tiff=no --with-dbus --with-xft --with-xpm --with-xim --with-gconf --with-gnutls --with-json --with-mailutils
+    ./configure --prefix=/root/local --with-native-compilation --with-tiff=no --without-dbus --without-xft --without-xpm --without-xim --without-gconf --with-gnutls --with-json --without-mailutils --without-jpeg --without-tiff --without-gif --without-png --without-rsvg --without-lcms2 --without-libsystemd --without-cairo --without-xml2 --without-native-image-api --without-xft --without-harfbuzz --without-libotf --without-toolkit-scroll-bars --without-xaw3d --without-xim --without-xdbe --without-gpm --without-gsettings --without-selinux --without-libgmp --without-kerberos --without-kerberos5 --without-hesiod --with-sound=no  --with-x-toolkit=no --with-x=no
 
 RUN mkdir -p ~/local/share && \
     cd ~/local/src/emacs-28.2 && \
