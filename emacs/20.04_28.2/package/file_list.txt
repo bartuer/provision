@@ -1,3 +1,8 @@
+/lib/x86_64-linux-gnu/libjansson.so.4
+/lib/x86_64-linux-gnu/libgccjit.so.0
+/lib/x86_64-linux-gnu/libisl.so.22
+/lib/x86_64-linux-gnu/libmpc.so.3
+/lib/x86_64-linux-gnu/libmpfr.so.6
 /var/
 /var/lib/
 /var/lib/dictionaries-common/
