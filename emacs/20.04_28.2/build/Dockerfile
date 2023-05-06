@@ -23,6 +23,7 @@ RUN add-apt-repository ppa:ubuntu-toolchain-r/ppa && \
     aspell-en \
     sbcl \
     r-base \
+    xclip \
     git
 
 RUN sed -i 's/# deb-src/deb-src/' /etc/apt/sources.list && \
