@@ -33,6 +33,7 @@ RUN sed -i 's/# deb-src/deb-src/' /etc/apt/sources.list && \
     apt-get autoremove
     
 RUN mkdir -p ~/etc && \
+    echo "rebuild 2" && \
     cd ~/etc && \
     git clone https://github.com/bartuer/dot-emacs.git el && \
     mkdir -p ~/local/src && \
