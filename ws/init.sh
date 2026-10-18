@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# init.sh -- plan 01 G.2: turn a bare WSL distro into a workspace box.  Runs as ROOT inside WSL.
+#   bash init.sh            dry-run (DEFAULT): prints KEY=ok|WOULD <action>|FAIL <why>, changes nothing
+#   bash init.sh --apply    (or INIT_APPLY=1) does the work; acted steps print KEY=did <action>
+# Steps: ROOT, WS (refuse a foreign /workspace -- checked first, before anything changes), APT (git git-lfs
+#   docker.io ca-certificates curl), DOCKERD (systemd -> enable --now; WSL without systemd -> [boot]
+#   systemd=true in /etc/wsl.conf + RESTART NEEDED, never restarts itself), GCM (git credential.helper ->
+#   the Windows Git Credential Manager under /mnt/c, so ADO auth pops on Windows), LFS (git lfs install),
+#   CLONE (cd / && git clone $WS_URL workspace + shallow single-branch submodules), INSTALL (./install.sh).
+# Last line RESULT=OK|PLAN|RESTART_NEEDED|REFUSED|FAIL.  rc: 0 OK/PLAN/RESTART_NEEDED, 1 FAIL, 2 REFUSED, 64 usage.
+# Env: WS_URL, WS_DIR (/workspace), INIT_APPLY=1, INIT_SKIP_INSTALL=1, INIT_SKIP_SUBMODULES=1,
+#      INIT_GCM (explicit helper exe), INIT_MNT (/mnt/c).
+# Idempotent: a 2nd --apply on a done box prints no `did` line.
+set -u
+export LC_ALL=C DEBIAN_FRONTEND=noninteractive
+
+WS_URL="${WS_URL:-https://dev.azure.com/MSRADKI/Excel/_git/workspace}"
+WS_DIR="${WS_DIR:-/workspace}"
+APPLY="${INIT_APPLY:-0}"
+MNT="${INIT_MNT:-/mnt/c}"
+PKGS="git git-lfs docker.io ca-certificates curl"
+for a in "$@"; do
+  case "$a" in
+    --apply) APPLY=1 ;;
+    --dry-run) APPLY=0 ;;
+    -h|--help) echo "usage: init.sh [--apply|--dry-run]  (as root in WSL; dry-run is the default)"; exit 0 ;;
+    *) echo "usage: init.sh [--apply|--dry-run]" >&2; exit 64 ;;
+  esac
+done
+
+fail=0; restart=0
+say() { echo "$1=$2"; }
+bad() { echo "$1=FAIL $2"; fail=1; }
+# act KEY "description" cmd... : dry-run -> WOULD, apply -> run it (did | FAIL)
+planned=0
+act() {
+  local k="$1" d="$2"; shift 2
+  if [ "$APPLY" != 1 ]; then say "$k" "WOULD $d"; planned=1; return 0; fi
+  if "$@"; then say "$k" "did $d"; return 0; fi
+  bad "$k" "$d"; return 1
+}
+finish() {
+  if [ "${1:-}" = REFUSED ]; then echo "RESULT=REFUSED"; exit 2; fi
+  if [ "$fail" != 0 ]; then echo "RESULT=FAIL"; exit 1; fi
+  if [ "$restart" != 0 ]; then echo "RESULT=RESTART_NEEDED"; exit 0; fi
+  if [ "$planned" != 0 ]; then echo "RESULT=PLAN"; exit 0; fi
+  echo "RESULT=OK"; exit 0
+}
+is_wsl() { [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; }
+norm()   { local u="${1%/}"; echo "${u%.git}"; }
+
+say MODE "$([ "$APPLY" = 1 ] && echo apply || echo dry-run)"
+
+# ROOT
+if [ "$(id -u)" = 0 ]; then say ROOT ok; else bad ROOT "not root (run: wsl -u root ...)"; finish; fi
+
+# WS -- refuse before anything changes
+ws_state=absent
+if [ -e "$WS_DIR" ]; then
+  if [ -e "$WS_DIR/.git" ]; then
+    o="$(git -C "$WS_DIR" config --get remote.origin.url 2>/dev/null || true)"
+    if [ "$(norm "$o")" = "$(norm "$WS_URL")" ]; then ws_state=clone; say WS "ok $WS_DIR is a clone of $WS_URL"
+    else echo "WS=REFUSE $WS_DIR exists, origin '${o:-none}' != $WS_URL -- move it away by hand"; finish REFUSED; fi
+  elif [ -d "$WS_DIR" ] && [ -z "$(ls -A "$WS_DIR" 2>/dev/null)" ]; then
+    ws_state=empty; say WS "ok $WS_DIR empty"
+  else
+    echo "WS=REFUSE $WS_DIR exists and is not a workspace clone -- move it away by hand"; finish REFUSED
+  fi
+else
+  say WS "ok $WS_DIR absent"
+fi
+
+# APT
+missing=""
+have_pkg() {   # a tool already on PATH counts (docker-ce instead of docker.io, a source-built git)
+  case "$1" in
+    git) command -v git >/dev/null 2>&1 && return 0 ;;
+    git-lfs) command -v git-lfs >/dev/null 2>&1 && return 0 ;;
+    docker.io) command -v docker >/dev/null 2>&1 && return 0 ;;
+    curl) command -v curl >/dev/null 2>&1 && return 0 ;;
+  esac
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'ok installed'
+}
+for p in $PKGS; do have_pkg "$p" || missing="$missing $p"; done
+apt_do() {
+  apt-get update -qq >/dev/null 2>&1
+  # shellcheck disable=SC2086
+  apt-get install -y -qq --no-install-recommends $missing >/dev/null 2>&1
+}
+if [ -z "$missing" ]; then say APT ok; else act APT "apt-get install$missing" apt_do || finish; fi
+
+# DOCKERD
+docker_up()      { command -v docker >/dev/null 2>&1 && docker info --format '{{.ServerVersion}}' >/dev/null 2>&1; }
+has_systemd()    { [ -d /run/systemd/system ]; }
+wslconf_systemd(){ grep -qiE '^[[:space:]]*systemd[[:space:]]*=[[:space:]]*true' /etc/wsl.conf 2>/dev/null; }
+write_wslconf() {   # systemd=true under [boot]; every other line kept
+  local f=/etc/wsl.conf t; t="$(mktemp)"
+  if grep -qiE '^[[:space:]]*\[boot\]' "$f" 2>/dev/null; then
+    awk '/^[[:space:]]*\[boot\]/{print; print "systemd=true"; next}
+         /^[[:space:]]*systemd[[:space:]]*=/{next} {print}' "$f" > "$t"
+  else
+    { [ -s "$f" ] && cat "$f" && echo; printf '[boot]\nsystemd=true\n'; } > "$t"
+  fi
+  cat "$t" > "$f"; rm -f "$t"
+}
+if docker_up; then say DOCKERD ok
+elif has_systemd; then
+  act DOCKERD "systemctl enable --now docker" sh -c 'systemctl enable --now docker.service >/dev/null 2>&1'
+  if [ "$APPLY" = 1 ] && ! docker_up; then bad DOCKERD "docker.service enabled but docker info fails"; fi
+elif is_wsl; then
+  restart=1
+  if wslconf_systemd; then say DOCKERD "RESTART NEEDED -- /etc/wsl.conf has systemd=true; from Windows: wsl --terminate ${WSL_DISTRO_NAME:-<distro>}, then re-run"
+  else act DOCKERD "[boot] systemd=true -> /etc/wsl.conf, then RESTART NEEDED (wsl --terminate ${WSL_DISTRO_NAME:-<distro>})" write_wslconf; fi
+else
+  say DOCKERD "WARN no docker server, no systemd, not WSL -- start dockerd yourself"
+fi
+
+# GCM
+gcm="${INIT_GCM:-}"
+if [ -z "$gcm" ]; then
+  for g in "$MNT/Program Files/Git/mingw64/bin/git-credential-manager.exe" \
+           "$MNT/Program Files/Git/mingw64/libexec/git-core/git-credential-manager.exe" \
+           "$MNT"/Program\ Files*/Git\ Credential\ Manager*/git-credential-manager*.exe \
+           "$MNT"/Users/*/AppData/Local/Programs/Git/mingw64/bin/git-credential-manager.exe; do
+    [ -x "$g" ] && { gcm="$g"; break; }
+  done
+fi
+if [ -z "$gcm" ]; then say GCM "WARN no Windows git-credential-manager.exe under $MNT (install Git for Windows; ADO auth then prompts in the terminal)"
+elif ! command -v git >/dev/null 2>&1; then say GCM "WOULD credential.helper -> $gcm (after APT)"
+else
+  helper="$(printf '%s' "$gcm" | sed 's/ /\\ /g')"
+  if [ "$(git config --system --get credential.helper 2>/dev/null)" = "$helper" ]; then say GCM ok
+  else
+    gcm_do() { git config --system credential.helper "$helper" && git config --system credential.https://dev.azure.com.useHttpPath true; }
+    act GCM "git config --system credential.helper $helper" gcm_do
+  fi
+fi
+
+# LFS
+if ! command -v git >/dev/null 2>&1 || ! git lfs version >/dev/null 2>&1; then say LFS "WOULD git lfs install --system (after APT)"
+elif git config --system --get filter.lfs.process >/dev/null 2>&1; then say LFS ok
+else act LFS "git lfs install --system" sh -c 'git lfs install --system >/dev/null'; fi
+
+# CLONE
+clone_do() {
+  if [ "$ws_state" = empty ]; then rmdir "$WS_DIR" || return 1; fi
+  (cd "$(dirname "$WS_DIR")" && git clone -q "$WS_URL" "$(basename "$WS_DIR")") || return 1
+  [ "${INIT_SKIP_SUBMODULES:-0}" = 1 ] && return 0
+  sub_do
+}
+sub_do() { git -C "$WS_DIR" submodule update --init --depth 1 --single-branch --jobs 6; }
+sub_missing() { [ "${INIT_SKIP_SUBMODULES:-0}" != 1 ] && git -C "$WS_DIR" submodule status 2>/dev/null | grep -q '^-'; }
+if [ "$ws_state" = clone ]; then
+  if sub_missing; then act CLONE "git submodule update --init --depth 1 --single-branch --jobs 6 (resume)" sub_do || finish
+  else say CLONE ok; fi
+else act CLONE "cd $(dirname "$WS_DIR") && git clone $WS_URL + git submodule update --init --depth 1 --single-branch --jobs 6" clone_do || finish; fi
+
+# INSTALL
+if [ "${INIT_SKIP_INSTALL:-0}" = 1 ]; then say INSTALL "skip (INIT_SKIP_INSTALL=1)"
+elif [ "$restart" = 1 ]; then say INSTALL "WOULD $WS_DIR/install.sh after the distro restart (re-run init.sh --apply)"
+elif [ "$APPLY" != 1 ]; then say INSTALL "WOULD cd $WS_DIR && ./install.sh"
+else
+  (cd "$WS_DIR" && ./install.sh); rc=$?
+  if [ $rc = 0 ]; then say INSTALL ok; else bad INSTALL "install.sh rc=$rc (re-run: cd $WS_DIR && ./install.sh)"; fi
+fi
+finish
