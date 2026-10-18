@@ -1,23 +1,26 @@
 <#
 .SYNOPSIS
     bootstrap.ps1 -- plan 01 G.1: a Windows box with nothing -> WSL2 distro + Git/GCM -> init.sh (clone
-    /workspace + ./install.sh).  PowerShell 5.1, no modules.  DRY-RUN BY DEFAULT: changes nothing, prints
+    /workspace + ./install.sh).  PowerShell 5.1, no modules.  REAL RUN BY DEFAULT; -DryRun (or $env:WS_DRY=1) changes nothing, prints
     what it would do.
 
 .DESCRIPTION
     Each step prints KEY=ok|WOULD <action>|FAIL <why>; the last line is RESULT=OK|PLAN|FAIL|REBOOT_NEEDED|
     RESTART_NEEDED|REFUSED.
-      ADMIN   elevated?  (-Apply needs it for WSL / DISTRO installs)
+      ADMIN   elevated?  (a real run needs it for WSL / DISTRO installs)
       WSL     `wsl --status`; absent -> `wsl --install --no-distribution` (a Windows reboot is then needed:
               says so and stops)
-      DISTRO  -Distro, else the default distro (docker-desktop* ignored); none -> `wsl --install -d
-              Ubuntu-24.04 --no-launch` + `ubuntu2404.exe install --root`
+      DISTRO  -Distro, else a registered Ubuntu-26.04, else the default distro IF it is Ubuntu 26.04
+              (docker-desktop* ignored).  The fleet is 26.04 only (emacs 30.1 + bin2md need GLIBC 2.43;
+              24.04 has 2.39), so a default distro on another release is LEFT ALONE and Ubuntu-26.04 is
+              installed beside it: `wsl --install -d Ubuntu-26.04 --no-launch` (a .wsl package: no
+              ubuntu2604.exe launcher; init.sh runs as -u root, so no OOBE user is needed)
       WSL2    version 1 -> `wsl --set-version <distro> 2`
       GIT     git.exe; absent -> `winget install -e --id Git.Git`
       GCM     `git credential-manager --version`; absent -> comes with Git, else
               `winget install -e --id Microsoft.GitCredentialManagerCore`
       INIT    init.sh (next to this file, else -InitUrl) run as root in the distro: dry-run -> its own dry
-              run is shown as `  init: ...` lines; -Apply -> `init.sh --apply`.  On failure the one-liner to
+              run is shown as `  init: ...` lines; real run -> `init.sh --apply`.  On failure the one-liner to
               paste in a WSL root console is printed.
     A distro restart (init.sh says RESTART_NEEDED: systemd was just enabled) is a separate gate
     -AllowRestart, done with `wsl --terminate <distro>` -- never `wsl --shutdown`.  It is refused (the
@@ -25,23 +28,27 @@
     running containers or tmux sessions.
 
 .EXAMPLE
-    irm https://tinyurl.com/<alias> | iex                                         # dry run
-    & ([scriptblock]::Create((irm https://tinyurl.com/<alias>))) -Apply           # do it
-    powershell -ExecutionPolicy Bypass -File bootstrap.ps1 -Apply -AllowRestart
+    irm tinyurl.com/ws-bootstrap | iex                          # real run
+    $env:WS_DRY=1; irm tinyurl.com/ws-bootstrap | iex           # dry run (changes nothing)
+    $env:WS_ALLOW_RESTART=1; ...                                # also allow one `wsl --terminate`; WS_DISTRO=<name>
+    powershell -ExecutionPolicy Bypass -File bootstrap.ps1 [-DryRun] [-AllowRestart]
 #>
 [CmdletBinding()]
 param(
-    [switch] $Apply,
-    [switch] $AllowRestart,
-    [string] $Distro  = '',
+    [switch] $DryRun       = ($env:WS_DRY -eq '1'),             # env twins: `irm | iex` cannot pass parameters
+    [switch] $Apply,                                            # accepted for old command lines; the real run is the default
+    [switch] $AllowRestart = ($env:WS_ALLOW_RESTART -eq '1'),
+    [string] $Distro  = "$env:WS_DISTRO",
     [string] $WsUrl   = 'https://dev.azure.com/MSRADKI/Excel/_git/workspace',
     [string] $InitUrl = ''
 )
 $ErrorActionPreference = 'Stop'
+$Apply = -not $DryRun
+Remove-Item Env:WS_DRY, Env:WS_ALLOW_RESTART, Env:WS_DISTRO -ErrorAction SilentlyContinue   # one-shot: a dry run must not stick to the next plain line
 $env:WSL_UTF8 = '1'                       # wsl.exe management output in UTF-8 (older WSL: UTF-16, NULs stripped below)
 $DefaultInitUrl = 'https://raw.githubusercontent.com/bartuer/provision/main/ws/init.sh'                      # set by bin/gist-publish.sh to the gist raw init.sh URL (G.4)
-$NewDistro      = 'Ubuntu-24.04'
-$NewDistroExe   = 'ubuntu2404.exe'
+$NewDistro      = 'Ubuntu-26.04'            # the fleet release (wsl --list --online name)
+$WantVersion    = '26.04'                   # VERSION_ID the distro must report
 $script:fail = 0; $script:result = ''
 function Emit($k, $v) { Write-Output "$k=$v"; if ("$v" -like 'FAIL*') { $script:fail++ } }
 function Done($r) { if ($r) { $script:result = $r }; if (-not $script:result) { $script:result = $(if ($script:fail) { 'FAIL' } elseif (-not $Apply) { 'PLAN' } else { 'OK' }) }
@@ -99,17 +106,30 @@ else {
 
 # DISTRO
 $all = @(Distros | Where-Object { $_.name -notlike 'docker-desktop*' })
+function DistroVer([string]$n) { (Native 'wsl.exe' @('-d', $n, '-u', 'root', '-e', 'sh', '-c', '. /etc/os-release; echo $ID $VERSION_ID') | Select-Object -Last 1) }
 if ($Distro) { $d = $all | Where-Object { $_.name -eq $Distro } | Select-Object -First 1 }
-else { $d = $all | Where-Object { $_.default } | Select-Object -First 1; if (-not $d) { $d = $all | Select-Object -First 1 } }
-if ($d) { $script:D = $d.name; Emit 'DISTRO' "ok $($d.name)" }
+else {
+    $d = $all | Where-Object { $_.name -eq $NewDistro } | Select-Object -First 1
+    if (-not $d) {
+        $dd = $all | Where-Object { $_.default } | Select-Object -First 1
+        if ($dd) { $v = DistroVer $dd.name
+                   if ($v -eq "ubuntu $WantVersion") { $d = $dd }
+                   else { Emit 'DISTRO' "skip default $($dd.name) ($v) -- not ubuntu $WantVersion, left untouched" } }
+    }
+}
+if ($d) {
+    $v = DistroVer $d.name; $script:D = $d.name
+    if ($v -eq "ubuntu $WantVersion") { Emit 'DISTRO' "ok $($d.name) ($v)" }
+    else { Emit 'DISTRO' "FAIL $($d.name) is '$v', the fleet needs ubuntu $WantVersion (omit -Distro to install $NewDistro beside it)"; return (Done) }
+}
 else {
     $want = $(if ($Distro) { $Distro } else { $NewDistro }); $script:D = $want
-    $exe  = $(if ($want -eq $NewDistro) { $NewDistroExe } else { ($want -replace '[-.]', '').ToLower() + '.exe' })
-    if (-not $Apply) { Emit 'DISTRO' "WOULD wsl --install -d $want --no-launch + $exe install --root" }
+    if (-not $Apply) { Emit 'DISTRO' "WOULD wsl --install -d $want --no-launch" }
     else {
         Native 'wsl.exe' @('--install', '-d', $want, '--no-launch') | ForEach-Object { "  wsl: $_" }
-        Native $exe @('install', '--root') | ForEach-Object { "  distro: $_" }
-        if (Distros | Where-Object { $_.name -eq $want }) { Emit 'DISTRO' "did wsl --install -d $want + $exe install --root" }
+        $v = $(if (Distros | Where-Object { $_.name -eq $want }) { DistroVer $want } else { '' })
+        if ($v -eq "ubuntu $WantVersion") { Emit 'DISTRO' "did wsl --install -d $want --no-launch ($v)" }
+        elseif ($v) { Emit 'DISTRO' "FAIL $want installed but reports '$v', not ubuntu $WantVersion"; return (Done) }
         else { Emit 'DISTRO' "FAIL $want not registered after install (rc=$($script:rc))"; return (Done) }
     }
 }

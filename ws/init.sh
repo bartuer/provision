@@ -2,13 +2,13 @@
 # init.sh -- plan 01 G.2: turn a bare WSL distro into a workspace box.  Runs as ROOT inside WSL.
 #   bash init.sh            dry-run (DEFAULT): prints KEY=ok|WOULD <action>|FAIL <why>, changes nothing
 #   bash init.sh --apply    (or INIT_APPLY=1) does the work; acted steps print KEY=did <action>
-# Steps: ROOT, WS (refuse a foreign /workspace -- checked first, before anything changes), APT (git git-lfs
+# Steps: ROOT, OS (ubuntu 26.04), WS (refuse a foreign /workspace -- checked first, before anything changes), APT (git git-lfs
 #   docker.io ca-certificates curl), DOCKERD (systemd -> enable --now; WSL without systemd -> [boot]
 #   systemd=true in /etc/wsl.conf + RESTART NEEDED, never restarts itself), GCM (git credential.helper ->
 #   the Windows Git Credential Manager under /mnt/c, so ADO auth pops on Windows), LFS (git lfs install),
 #   CLONE (cd / && git clone $WS_URL workspace + shallow single-branch submodules), INSTALL (./install.sh).
 # Last line RESULT=OK|PLAN|RESTART_NEEDED|REFUSED|FAIL.  rc: 0 OK/PLAN/RESTART_NEEDED, 1 FAIL, 2 REFUSED, 64 usage.
-# Env: WS_URL, WS_DIR (/workspace), INIT_APPLY=1, INIT_SKIP_INSTALL=1, INIT_SKIP_SUBMODULES=1,
+# Env: WS_URL, INIT_ANY_OS=1, WS_DIR (/workspace), INIT_APPLY=1, INIT_SKIP_INSTALL=1, INIT_SKIP_SUBMODULES=1,
 #      INIT_GCM (explicit helper exe), INIT_MNT (/mnt/c).
 # Idempotent: a 2nd --apply on a done box prints no `did` line.
 set -u
@@ -53,6 +53,12 @@ say MODE "$([ "$APPLY" = 1 ] && echo apply || echo dry-run)"
 
 # ROOT
 if [ "$(id -u)" = 0 ]; then say ROOT ok; else bad ROOT "not root (run: wsl -u root ...)"; finish; fi
+
+# OS -- the fleet is Ubuntu 26.04 only: emacs 30.1 + bin2md need GLIBC 2.43 (24.04 = 2.39).  INIT_ANY_OS=1 waives.
+os_id="$( . /etc/os-release 2>/dev/null; echo "${ID:-?} ${VERSION_ID:-?}")"
+if [ "$os_id" = "ubuntu 26.04" ]; then say OS "ok $os_id"
+elif [ "${INIT_ANY_OS:-0}" = 1 ]; then say OS "ok $os_id (INIT_ANY_OS=1, not the fleet release)"
+else bad OS "$os_id -- the fleet needs ubuntu 26.04 (wsl --install -d Ubuntu-26.04; INIT_ANY_OS=1 waives)"; finish; fi
 
 # WS -- refuse before anything changes
 ws_state=absent
