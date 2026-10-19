@@ -220,34 +220,41 @@ LFS_JOBS="${INIT_LFS_JOBS:-16}"   # parallel LFS downloads (126 MB parts; one st
 lfs_do() {   # foreground, so its meter owns the tty: "Downloading LFS objects: 45% (35/78), 2.7 GB | 40 MB/s"
   [ "${INIT_SKIP_LFS:-0}" = 1 ] && return 0
   git -C "$WS_DIR" config lfs.concurrenttransfers "$LFS_JOBS" || return 1
-  local n tot; n="$(git -C "$WS_DIR" lfs ls-files 2>/dev/null | wc -l)"
-  tot="$(git -C "$WS_DIR" lfs ls-files -s 2>/dev/null | sed -n 's/.*(\([0-9.]*\) \([KMG]\)B)$/\1 \2/p' | awk '{m=($2=="G")?1024:($2=="K")?1/1024:1; t+=$1*m} END {printf "%.1f GB", t/1024}')"
-  echo "LFS: $n objects, $tot, $LFS_JOBS downloads in parallel"
-  # details: GIT_LFS_PROGRESS gets "download <i>/<n> <got>/<size> <path>" per update; lfs_watch turns it into
-  # one line per finished file + a status line every 5s (git's own \r meter would scramble with these)
-  local prog=/tmp/ws-lfs.progress; : >"$prog"
-  lfs_watch "$prog" "$n" & local w=$!
-  GIT_LFS_PROGRESS="$prog" git -C "$WS_DIR" lfs pull 2>/tmp/ws-lfs.err; local rc=$?
-  sleep 1; kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
-  lfs_status "$prog" "$n" final
-  [ $rc = 0 ] || { echo "LFS: git lfs pull FAILED (rc=$rc):"; tail -20 /tmp/ws-lfs.err; }
+  # details: the object store is the truth (GIT_LFS_PROGRESS reports size -1 for ADO): a finished object lands in
+  # .git/lfs/objects/<oid>, the one in flight grows in .git/lfs/incomplete.  lfs_watch prints one line per
+  # finished file + a status line every 10s; git's own \r meter would scramble with those, so it goes to a log.
+  local map=/tmp/ws-lfs.map
+  git -C "$WS_DIR" lfs ls-files -l -s 2>/dev/null | sed -n 's/^\([0-9a-f]*\) [-*] \(.*\) (\(.*\))$/\1\t\2\t\3/p' >"$map"
+  local n tot; n="$(grep -c . "$map")"
+  tot="$(awk -F'\t' '{split($3,a," "); m=(a[2]=="GB")?1024:(a[2]=="KB")?1/1024:(a[2]=="B")?1/1048576:1; t+=a[1]*m} END {printf "%.1f GB", t/1024}' "$map")"
+  echo "LFS: $n objects, $tot, $LFS_JOBS downloads in parallel (git's meter: /tmp/ws-lfs.err)"
+  export LFS_T0 LFS_G0; LFS_T0="$(date +%s)"; LFS_G0="$(du -sb "$WS_DIR/.git/lfs/objects" 2>/dev/null | cut -f1)"
+  lfs_watch "$WS_DIR" "$map" "$n" & local w=$!
+  git -C "$WS_DIR" lfs pull 2>/tmp/ws-lfs.err; local rc=$?
+  kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
+  lfs_status "$WS_DIR" "$map" "$n" "$LFS_T0" final
+  [ $rc = 0 ] || { echo "LFS: git lfs pull FAILED (rc=$rc):"; tr '\r' '\n' </tmp/ws-lfs.err | tail -20; }
   return $rc
 }
-lfs_status() {   # one summary line from the progress file: files done, bytes, rate, files in flight
-  awk -v n="$2" -v tag="$3" -v t0="${LFS_T0:-0}" -v now="$(date +%s)" '
-    $1=="download" { split($3,b,"/"); p=$4; for(i=5;i<=NF;i++) p=p" "$i; got[p]=b[1]; sz[p]=b[2] }
-    END { d=0; g=0; fl=""; nf=0
-          for (p in got) { g+=got[p]; if (got[p]>=sz[p]) d++; else { nf++; if (nf<=3) { k=p; sub(/.*\//,"",k); fl=fl " " k " " int(100*got[p]/sz[p]) "%" } } }
-          el=now-t0; if (el<1) el=1
-          printf "LFS %s: %d/%d files, %.2f GB, %.1f MB/s, %ds%s\n", (tag?tag:"progress"), d, n, g/1073741824, g/1048576/el, el, (nf? ", in flight " nf ":" fl : "") }' "$1"
+lfs_have() { find "$1/.git/lfs/objects" -type f -size +0 2>/dev/null | sed 's|.*/||'; }   # oids already local
+lfs_status() {   # dir map n t0 [tag]: files done, GB, MB/s since t0, bytes in flight
+  local d g f el
+  d="$(lfs_have "$1" | grep -cFf - <(cut -f1 "$2"))"
+  g="$(du -sb "$1/.git/lfs/objects" 2>/dev/null | cut -f1)"; f="$(du -sb "$1/.git/lfs/incomplete" 2>/dev/null | cut -f1)"
+  el=$(( $(date +%s) - $4 )); [ $el -lt 1 ] && el=1
+  awk -v d="$d" -v n="$3" -v g="${g:-0}" -v f="${f:-0}" -v el="$el" -v tag="${5:-progress}" -v g0="${LFS_G0:-0}" \
+    'BEGIN { printf "LFS %s: %d/%d files, %.2f GB, %.1f MB/s, %dm%02ds\n", tag, d, n, (g+f)/1073741824, (g+f-g0)/1048576/el, el/60, el%60 }'
 }
-lfs_watch() {    # "LFS done 12/78 archive/x.tar.gz.03 (126 MB)" per finished file, status every 5s
-  local prog="$1" n="$2" seen=0 i=0
-  export LFS_T0; LFS_T0="$(date +%s)"
-  while sleep 1; do
-    awk -v seen="$seen" '$1=="download" { split($3,b,"/"); if (b[1]>=b[2] && !(($4) in done)) { done[$4]=1; c++; if (c>seen) { split($2,f,"/"); printf "LFS done %s %s (%.0f MB)\n", $2, $4, b[2]/1048576 } } } END { }' "$prog"
-    seen="$(awk '$1=="download" { split($3,b,"/"); if (b[1]>=b[2]) d[$4]=1 } END { print length(d)+0 }' "$prog")"
-    i=$((i+1)); [ $((i % 5)) = 0 ] && lfs_status "$prog" "$n"
+lfs_watch() {    # dir map n: "LFS done 12/78 archive/x.tar.gz.03 (126 MB)" per finished file, status every 10s
+  local t0="${LFS_T0:-$(date +%s)}" i=0 done c=0 oid name size
+  done="$(lfs_have "$1")"; c="$(lfs_have "$1" | grep -cFf - <(cut -f1 "$2"))"
+  while sleep 2; do
+    while IFS=$'\t' read -r oid name size; do
+      case "$done" in *"$oid"*) continue;; esac
+      [ -s "$1/.git/lfs/objects/${oid:0:2}/${oid:2:2}/$oid" ] || continue
+      done="$done $oid"; c=$((c+1)); echo "LFS done $c/$3 $name ($size)"
+    done <"$2"
+    i=$((i+1)); [ $((i % 5)) = 0 ] && lfs_status "$1" "$2" "$3" "$t0"
   done
 }
 sub_lfs_do() {   # ssg_agent (no LFS) clones in the BACKGROUND while the LFS bundles download; its log -> /tmp/ws-sub.log
@@ -268,7 +275,8 @@ clone_do() {
   if [ "$ws_state" = empty ]; then rmdir "$WS_DIR" || return 1; fi
   (cd "$(dirname "$WS_DIR")" && GIT_TERMINAL_PROMPT=0 GIT_LFS_SKIP_SMUDGE=1 git clone --progress "$WS_URL" "$(basename "$WS_DIR")") || return 1
   # Q.5: the public OA base (4.2 GB from mcr) downloads CONCURRENT with the LFS fetch; install.sh stage 9 awaits it
-  [ "${INIT_SKIP_LFS:-0}" = 1 ] || (cd "$WS_DIR" && ./install.sh --pull-base) >/dev/null 2>&1
+  [ "${INIT_SKIP_LFS:-0}" = 1 ] || { (cd "$WS_DIR" && ./install.sh --pull-base) >/dev/null 2>&1
+    echo "NOTE: OA base image (~4.2 GB, docker pull from mcr) downloads in the background and SHARES bandwidth with LFS; log /tmp/ws-oa-pull.log"; }
   sub_lfs_do
 }
 sub_missing() { [ "${INIT_SKIP_SUBMODULES:-0}" != 1 ] && git -C "$WS_DIR" submodule status $(sub_paths) 2>/dev/null | grep -q '^-'; }
