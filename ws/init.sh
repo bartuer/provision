@@ -142,11 +142,23 @@ net_do() {
   net_probe -4 && return 0
   net_diag; return 1
 }
+net_dns() {   # Global Secure Access answers with synthetic 6.6.x.x addresses that only the Windows client can route:
+  # resolve through the host's / public DNS instead (this boot only; a WSL restart regenerates resolv.conf)
+  local c bak=/etc/resolv.conf.ws-net
+  cp -aL /etc/resolv.conf "$bak" 2>/dev/null || true
+  printf 'Acquire::ForceIPv4 "true";\n' > /etc/apt/apt.conf.d/99ws-ipv4
+  for c in ${INIT_DNS_WIN:-} 1.1.1.1 8.8.8.8; do
+    rm -f /etc/resolv.conf 2>/dev/null; printf 'nameserver %s\n' "$c" > /etc/resolv.conf
+    dns_ok && net_probe -4 && { echo "net: using nameserver $c -> $(getent ahosts archive.ubuntu.com | awk 'NR==1{print $1}')" >&2; return 0; }
+  done
+  cp -a "$bak" /etc/resolv.conf 2>/dev/null; return 1
+}
 : > /tmp/ws-net.err
 if ! dns_ok; then say NET "skip (DNS not fixed yet)"
 elif command -v curl >/dev/null 2>&1 && net_probe -6; then say NET "ok (IPv6)"
 elif net_probe -4; then
   if [ -f /etc/apt/apt.conf.d/99ws-ipv4 ]; then say NET "ok (IPv4, apt pinned)"; else act NET "pin apt to IPv4 (IPv6 unreachable)" net_do || finish; fi
+elif [ "$APPLY" = 1 ] && net_dns; then say NET "did resolve via another nameserver + apt IPv4 (the WSL resolver gave an address WSL cannot reach)"
 else
   net_diag; bad NET "archive.ubuntu.com:80 unreachable (see net: lines) -- Windows VPN / Global Secure Access / proxy blocks WSL"; finish
 fi

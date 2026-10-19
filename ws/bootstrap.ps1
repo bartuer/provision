@@ -414,6 +414,11 @@ function WslCfgSet($want) {   # CLEAN: .wslconfig becomes exactly the fleet file
     [IO.File]::WriteAllLines($f, [string[]]$out)   # no BOM: WSL ignores a .wslconfig that starts with one
     return $true
 }
+function RebootPending {   # Windows Update / CBS / file renames waiting for a reboot: half-applied network stack (WSL, GSA, Hyper-V switch)
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
+                   'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { if (Test-Path $k) { return $true } }
+    return $false
+}
 function FixWslNet {
     $desc = ($FleetWslCfg.Keys | ForEach-Object { "$_=$($FleetWslCfg[$_])" }) -join ' '
     $dns = NetOk
@@ -444,7 +449,30 @@ function FixWslNet {
     Start-Sleep -Seconds 8
     $null = DistroVer
     if (NetOk) { Emit 'WSLNET' "did clean .wslconfig ($desc) + distro DNS pins + wsl --shutdown; net ok"; $script:netOk = $true; return }
-    Emit 'WSLNET' "FAIL archive.ubuntu.com still unreachable with the clean fleet .wslconfig ($desc) after a restart -- Windows side: Global Secure Access / VPN / proxy (try the same URL in a Windows browser)"; $script:netOk = $false
+    NetDiag
+    if (RebootPending) { Emit 'WSLNET' "FAIL WSL cannot reach archive.ubuntu.com and Windows has an update waiting for a REBOOT -- finish the update, reboot, then run this again"; $script:netOk = $false; return }
+    # Windows reaches it, mirrored WSL does not (Global Secure Access / Hyper-V firewall outbound policy): fall back to NAT
+    $nat = [ordered]@{ networkingMode = 'nat'; vmIdleTimeout = '-1' }
+    Step "WSLNET: mirrored cannot reach archive.ubuntu.com; trying NAT ([wsl2] networkingMode=nat) + wsl --shutdown"
+    $null = WslCfgSet $nat
+    Native 'wsl.exe' @('--shutdown') -Timeout 60 | Out-Null
+    Start-Sleep -Seconds 8
+    $null = DistroVer
+    if (NetOk) { Emit 'WSLNET' "did .wslconfig networkingMode=nat (mirrored was blocked on this box) + wsl --shutdown; net ok"; $script:netOk = $true; return }
+    NetDiag
+    $null = WslCfgSet $FleetWslCfg   # back to the fleet file; NAT did not help either
+    # not fatal: init.sh's NET step still tries the host / public nameservers (Global Secure Access hands out
+    # 6.6.x.x addresses only its Windows client can route) and prints net: lines if that fails too
+    Emit 'WSLNET' "WARN archive.ubuntu.com unreachable from WSL in mirrored and nat mode (Windows reaches it) -- init.sh will try other nameservers; net-diag lines above"; $script:netOk = $true
+}
+function NetDiag {   # why WSL cannot get out while Windows can: proxy, Hyper-V firewall, in-distro route + the real error
+    try { $ie = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -EA Stop
+          Write-Host "    net-diag: win proxy: enable=$($ie.ProxyEnable) server=$($ie.ProxyServer) pac=$($ie.AutoConfigURL)" } catch {}
+    try { Write-Host "    net-diag: winhttp: $(((netsh winhttp show proxy) | Where-Object { $_ -match '\S' } | Select-Object -Skip 1) -join ' ' -replace '\s+', ' ')" } catch {}
+    try { $fw = Get-NetFirewallHyperVVMSetting -PolicyStore ActiveStore -Name '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -EA Stop
+          Write-Host "    net-diag: hyperv-fw: enabled=$($fw.Enabled) outbound=$($fw.DefaultOutboundAction) inbound=$($fw.DefaultInboundAction)" } catch {}
+    try { Write-Host "    net-diag: win route: $((Find-NetRoute -RemoteIPAddress ((Resolve-DnsName archive.ubuntu.com -Type A -EA Stop | Where-Object IPAddress | Select-Object -First 1).IPAddress) -EA Stop | Where-Object InterfaceAlias | Select-Object -First 1).InterfaceAlias)" } catch {}
+    foreach ($l in @(InDistro 'echo "cfg: $(grep -v "^#" /etc/resolv.conf | tr "\n" " ")"; ip -4 -br addr | sed "s/^/addr: /"; ip -4 route | sed "s/^/route: /"; getent ahosts archive.ubuntu.com | head -2 | sed "s/^/resolve: /"; timeout 10 bash -c "exec 3<>/dev/tcp/archive.ubuntu.com/80" 2>&1 | tail -1 | sed "s/^/tcp: /"')) { if ("$l".Trim()) { Write-Host "    net-diag: $l" } }
 }
 $distroUp = [bool](Distros | Where-Object { $_.name -eq $script:D })
 if (-not $Apply) {
