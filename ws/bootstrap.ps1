@@ -382,7 +382,7 @@ function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding man
         Write-Progress -Activity 'init.sh --apply (in the Ubuntu window)' -Completed
         $rcs = & wsl.exe -d $script:D -u root -e sh -c "cat /tmp/ws-init.rc 2>/dev/null" 2>$null
         $script:rc = if ("$rcs".Trim() -match '^\d+$') { [int]"$rcs".Trim() } else { 1 }
-        $script:initOut = @(& wsl.exe -d $script:D -u root -e sh -c "tr '\r' '\n' < /tmp/ws-init.out 2>/dev/null | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | grep -E '^[A-Z_]+='" 2>$null | ForEach-Object { ("$_" -replace "`0", '').Trim() } | Where-Object { $_ })
+        $script:initOut = @(& wsl.exe -d $script:D -u root -e sh -c "tr '\r' '\n' < /tmp/ws-init.out 2>/dev/null | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | grep -aE '^[A-Z_]+='" 2>$null | ForEach-Object { ("$_" -replace "`0", '').Trim() } | Where-Object { $_ })
         foreach ($l in $script:initOut) { Write-Host "  init: $l" }
         Write-Host ("  init: rc={0} in {1}s  (full log in the distro: /tmp/ws-init.out)" -f $script:rc, [int]$sw.Elapsed.TotalSeconds)
         return
@@ -469,7 +469,19 @@ if ($r -eq 'RESTART_NEEDED') {
 }
 Emit 'GCMPATH' "win=$(if ($GcmWin) { $GcmWin } else { 'NOT FOUND' }) git=$GitWin"
 Emit 'NODEPATH' "win=$(if ($NodeWin) { $NodeWin } else { 'NOT FOUND' })"
-if ($r -eq 'OK') { Emit 'INIT' "ok init.sh --apply in $($script:D)" }
+if ($r -eq 'OK') {
+    Emit 'INIT' "ok init.sh --apply in $($script:D)"
+    # Land the user in GHCP CLI inside the bench container, in its OWN window (init.sh runs install.sh with WS_CLI=0:
+    # a TUI inside the init window filled /tmp/ws-init.out with binary and replaced the window).  $env:WS_CLI=0 skips.
+    if ($env:WS_CLI -ne '0') {
+        $path = (Get-Command wsl.exe).Source
+        $cli = @('-d', $script:D, '-u', 'root', '-e', 'docker', 'exec', '-it', 'officeagent-dev', 'bash', '-ic', 't main')
+        $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
+        if ($wt -and $env:WS_WT -ne '0') { Start-Process -FilePath $wt.Source -ArgumentList ((@('-w', 'new', 'new-tab', '--title', 'GHCP CLI (officeagent-dev)', $path) + $cli | ForEach-Object { Q $_ }) -join ' ') }
+        else { Start-Process -FilePath $path -ArgumentList (($cli | ForEach-Object { Q $_ }) -join ' ') }
+        Emit 'CLI' "opened GHCP CLI in officeagent-dev (new window; tmux 'main', detach C-b d). Later: wsl, then docker exec -it officeagent-dev bash -> t / h / ec"
+    }
+}
 else {
     $why = @($script:initOut | Where-Object { $_ -match '=FAIL' }) -join '; '
     if (-not $why) { $why = "RESULT=$r rc=$($script:rc)" }

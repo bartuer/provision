@@ -456,7 +456,7 @@ if [ "${INIT_SKIP_INSTALL:-0}" = 1 ]; then say INSTALL "skip (INIT_SKIP_INSTALL=
 elif [ "$restart" = 1 ]; then say INSTALL "WOULD $WS_DIR/install.sh after the distro restart (re-run init.sh --apply)"
 elif [ "$APPLY" != 1 ]; then say INSTALL "WOULD cd $WS_DIR && ./install.sh"
 else
-  (cd "$WS_DIR" && ./install.sh); rc=$?
+  (cd "$WS_DIR" && WS_CLI=0 ./install.sh); rc=$?   # bootstrap.ps1 opens GHCP CLI in its own window afterwards
   if [ $rc = 0 ]; then say INSTALL ok; else bad INSTALL "install.sh rc=$rc (re-run: cd $WS_DIR && ./install.sh)"; fi
 fi
 finish
