@@ -53,13 +53,65 @@ $script:fail = 0; $script:result = ''
 function Emit($k, $v) { Write-Output "$k=$v"; if ("$v" -like 'FAIL*') { $script:fail++ } }
 function Done($r) { if ($r) { $script:result = $r }; if (-not $script:result) { $script:result = $(if ($script:fail) { 'FAIL' } elseif (-not $Apply) { 'PLAN' } else { 'OK' }) }
                     Write-Output "RESULT=$($script:result)"; $script:exitCode = $(if ($script:result -in @('FAIL','REFUSED')) { 1 } else { 0 }) }
-function Native([string]$exe, [string[]]$a) {   # run a native exe, return stdout lines (NULs stripped), $script:rc
-    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try { $o = & $exe @a 2>&1 | ForEach-Object { "$_" -replace "`0", '' } ; $script:rc = $LASTEXITCODE }
-    catch { $o = @("$_"); $script:rc = 9009 }
-    finally { $ErrorActionPreference = $old }
-    return @($o | Where-Object { $_ -ne '' })
+function Q([string]$x) { if ($x -eq '' -or $x -match '[\s"]') { '"' + ($x -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"' } else { $x } }
+function Native([string]$exe, [string[]]$a, [int]$Timeout = 120, [string]$Tag = '') {
+    # run a native exe LIVE: every line is shown as it arrives (`  <tag>: ...`, \r progress redrawn in place),
+    # a heartbeat every 15s of silence, killed after $Timeout s (rc 1460).  stdin is CLOSED, so a "press any key"
+    # prompt (the inbox wsl.exe stub on a box without WSL) gets EOF instead of hanging forever.
+    # Returns the \n-terminated lines (NULs stripped); $script:rc = exit code.
+    if (-not $Tag) { $Tag = [IO.Path]::GetFileNameWithoutExtension($exe) }
+    $cmdline = "$exe $($a -join ' ')"
+    $out = New-Object System.Collections.Generic.List[string]
+    $path = (Get-Command $exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    if (-not $path) { $script:rc = 9009; Write-Host "  ${Tag}: not found: $exe"; return @() }
+    $psi = New-Object Diagnostics.ProcessStartInfo $path
+    $psi.Arguments = ($a | ForEach-Object { Q $_ }) -join ' '
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true
+    try { $p = [Diagnostics.Process]::Start($psi) } catch { $script:rc = 9009; Write-Host "  ${Tag}: start failed: $_"; return @() }
+    try { $p.StandardInput.Close() } catch {}
+    $rd = @(@{ s = $p.StandardOutput; b = New-Object char[] 4096; t = $null; acc = ''; done = $false },
+            @{ s = $p.StandardError;  b = New-Object char[] 4096; t = $null; acc = ''; done = $false })
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $last = 0; $cr = $false
+    $show = { param($l, $isCr)
+        $l = ($l -replace "`0", '').TrimEnd()
+        if ($l -eq '') { return }
+        if ($isCr) { Write-Host -NoNewline ("`r  ${Tag}: " + $l + '   '); $script:crOpen = $true }
+        else { if ($script:crOpen) { Write-Host '' ; $script:crOpen = $false }; Write-Host "  ${Tag}: $l"; $out.Add($l) } }
+    $script:crOpen = $false
+    while ($true) {
+        $busy = $false
+        foreach ($r in $rd) {
+            if ($r.done) { continue }
+            if (-not $r.t) { $r.t = $r.s.ReadAsync($r.b, 0, $r.b.Length) }
+            if ($r.t.IsCompleted) {
+                $busy = $true; $n = $r.t.Result; $r.t = $null
+                if ($n -le 0) { $r.done = $true; if ($r.acc) { & $show $r.acc $false; $r.acc = '' }; continue }
+                $r.acc += (New-Object string ($r.b, 0, $n))
+                while ($r.acc -match '^([^\r\n]*)([\r\n])') {
+                    $seg = $Matches[1]; $sep = $Matches[2]; $r.acc = $r.acc.Substring($seg.Length + 1)
+                    if ($sep -eq "`r" -and $r.acc.StartsWith("`n")) { $r.acc = $r.acc.Substring(1); $sep = "`n" }
+                    & $show $seg ($sep -eq "`r")
+                }
+                $last = $sw.Elapsed.TotalSeconds
+            }
+        }
+        if ($rd[0].done -and $rd[1].done) { break }
+        $t = $sw.Elapsed.TotalSeconds
+        if ($t -gt $Timeout) {
+            try { $p.Kill() } catch {}
+            if ($script:crOpen) { Write-Host ''; $script:crOpen = $false }
+            Write-Host "  ${Tag}: TIMEOUT after $([int]$t)s -- killed: $cmdline"; $script:rc = 1460; return @($out)
+        }
+        if ($t - $last -ge 15) { if ($script:crOpen) { Write-Host ''; $script:crOpen = $false }
+                                 Write-Host "  ${Tag}: ... still running $([int]$t)s (timeout ${Timeout}s): $cmdline"; $last = $t }
+        if (-not $busy) { Start-Sleep -Milliseconds 100 }
+    }
+    if ($script:crOpen) { Write-Host ''; $script:crOpen = $false }
+    $p.WaitForExit(); $script:rc = $p.ExitCode
+    return @($out)
 }
+function Step([string]$m) { Write-Host "-- $m" }
 function InWsl {   # this PowerShell started from a WSL shell (interop)?  then terminating the distro kills us
     if ($env:WSL_DISTRO_NAME) { return $true }
     $id = $PID
@@ -93,20 +145,23 @@ Emit 'ADMIN' $(if ($isAdmin) { 'ok' } else { 'NO (installs of WSL / a distro nee
 
 # WSL
 $haveWsl = [bool](Get-Command wsl.exe -ErrorAction SilentlyContinue)
-if ($haveWsl) { Native 'wsl.exe' @('--status') | Out-Null }
+Step "WSL: wsl --status (timeout 60s; a 'press any key' stub prompt gets EOF)"
+if ($haveWsl) { Native 'wsl.exe' @('--status') -Timeout 60 | Out-Null }
 if ($haveWsl -and $script:rc -eq 0) { Emit 'WSL' 'ok' }
 elseif (-not $Apply) { Emit 'WSL' 'WOULD wsl --install --no-distribution (then a Windows reboot)'; Emit 'DISTRO' "WOULD wsl --install -d $NewDistro --no-launch (after reboot)"; return (Done) }
 elseif (-not $isAdmin) { Emit 'WSL' 'FAIL not admin: re-run from an elevated PowerShell'; return (Done) }
 else {
-    $o = Native 'wsl.exe' @('--install', '--no-distribution'); $o | ForEach-Object { "  wsl: $_" }
-    Native 'wsl.exe' @('--status') | Out-Null
+    Step 'WSL: wsl --install --no-distribution (downloads WSL; progress below, timeout 30 min)'
+    Native 'wsl.exe' @('--install', '--no-distribution') -Timeout 1800 | Out-Null
+    Native 'wsl.exe' @('--status') -Timeout 60 | Out-Null
     if ($script:rc -eq 0) { Emit 'WSL' 'did wsl --install --no-distribution' }
     else { Emit 'WSL' 'did wsl --install --no-distribution -- REBOOT Windows, then run this again'; return (Done 'REBOOT_NEEDED') }
 }
 
 # DISTRO
 $all = @(Distros | Where-Object { $_.name -notlike 'docker-desktop*' })
-function DistroVer([string]$n) { (Native 'wsl.exe' @('-d', $n, '-u', 'root', '-e', 'sh', '-c', '. /etc/os-release; echo $ID $VERSION_ID') | Select-Object -Last 1) }
+function DistroVer([string]$n) { Step "DISTRO: release of $n (first start of a distro can take a minute)"
+    (Native 'wsl.exe' @('-d', $n, '-u', 'root', '-e', 'sh', '-c', '. /etc/os-release; echo $ID $VERSION_ID') -Timeout 300 | Select-Object -Last 1) }
 if ($Distro) { $d = $all | Where-Object { $_.name -eq $Distro } | Select-Object -First 1 }
 else {
     $d = $all | Where-Object { $_.name -eq $NewDistro } | Select-Object -First 1
@@ -126,7 +181,8 @@ else {
     $want = $(if ($Distro) { $Distro } else { $NewDistro }); $script:D = $want
     if (-not $Apply) { Emit 'DISTRO' "WOULD wsl --install -d $want --no-launch" }
     else {
-        Native 'wsl.exe' @('--install', '-d', $want, '--no-launch') | ForEach-Object { "  wsl: $_" }
+        Step "DISTRO: wsl --install -d $want --no-launch (downloads the distro; progress below, timeout 30 min)"
+        Native 'wsl.exe' @('--install', '-d', $want, '--no-launch') -Timeout 1800 | Out-Null
         $v = $(if (Distros | Where-Object { $_.name -eq $want }) { DistroVer $want } else { '' })
         if ($v -eq "ubuntu $WantVersion") { Emit 'DISTRO' "did wsl --install -d $want --no-launch ($v)" }
         elseif ($v) { Emit 'DISTRO' "FAIL $want installed but reports '$v', not ubuntu $WantVersion"; return (Done) }
@@ -139,13 +195,14 @@ $d = Distros | Where-Object { $_.name -eq $script:D } | Select-Object -First 1
 if (-not $d) { Emit 'WSL2' "WOULD check version of $($script:D) (not installed yet)" }
 elseif ($d.ver -eq 2) { Emit 'WSL2' 'ok' }
 elseif (-not $Apply) { Emit 'WSL2' "WOULD wsl --set-version $($script:D) 2" }
-else { Native 'wsl.exe' @('--set-version', $script:D, '2') | Out-Null
+else { Step "WSL2: wsl --set-version $($script:D) 2"; Native 'wsl.exe' @('--set-version', $script:D, '2') -Timeout 1800 | Out-Null
        if ($script:rc -eq 0) { Emit 'WSL2' "did wsl --set-version $($script:D) 2" } else { Emit 'WSL2' "FAIL wsl --set-version rc=$($script:rc)" } }
 
 # GIT
 if (Get-Command git.exe -ErrorAction SilentlyContinue) { Emit 'GIT' 'ok' }
 elseif (-not $Apply) { Emit 'GIT' 'WOULD winget install -e --id Git.Git' }
-else { Native 'winget.exe' @('install', '-e', '--id', 'Git.Git', '--silent', '--accept-package-agreements', '--accept-source-agreements') | Out-Null
+else { Step 'GIT: winget install Git.Git (timeout 30 min)'
+       Native 'winget.exe' -Timeout 1800 -a @('install', '-e', '--id', 'Git.Git', '--silent', '--accept-package-agreements', '--accept-source-agreements') | Out-Null
        RefreshPath
        if (Get-Command git.exe -ErrorAction SilentlyContinue) { Emit 'GIT' 'did winget install Git.Git' } else { Emit 'GIT' "FAIL winget install Git.Git rc=$($script:rc)" } }
 
@@ -154,7 +211,8 @@ $gcmOk = $false
 if (Get-Command git.exe -ErrorAction SilentlyContinue) { Native 'git.exe' @('credential-manager', '--version') | Out-Null; $gcmOk = ($script:rc -eq 0) }
 if ($gcmOk) { Emit 'GCM' 'ok' }
 elseif (-not $Apply) { Emit 'GCM' 'WOULD (ships with Git for Windows) else winget install -e --id Microsoft.GitCredentialManagerCore' }
-else { Native 'winget.exe' @('install', '-e', '--id', 'Microsoft.GitCredentialManagerCore', '--silent', '--accept-package-agreements', '--accept-source-agreements') | Out-Null
+else { Step 'GCM: winget install Microsoft.GitCredentialManagerCore (timeout 30 min)'
+       Native 'winget.exe' -Timeout 1800 -a @('install', '-e', '--id', 'Microsoft.GitCredentialManagerCore', '--silent', '--accept-package-agreements', '--accept-source-agreements') | Out-Null
        RefreshPath; Native 'git.exe' @('credential-manager', '--version') | Out-Null
        if ($script:rc -eq 0) { Emit 'GCM' 'did winget install GitCredentialManagerCore' } else { Emit 'GCM' 'FAIL git credential-manager still absent' } }
 
@@ -170,9 +228,9 @@ function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding man
     $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($init -replace "`r`n", "`n")))
     $cmd = "echo $b64 | base64 -d > /tmp/ws-init.sh && WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode; rc=`$?; rm -f /tmp/ws-init.sh; exit `$rc"
     $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    $script:initOut = @(& wsl.exe -d $script:D -u root -e bash -c $cmd 2>&1 | ForEach-Object { "$_" }); $script:rc = $LASTEXITCODE
+    Step "INIT: init.sh $mode as root in $($script:D) (live output below)"
+    $script:initOut = @(& wsl.exe -d $script:D -u root -e bash -c $cmd 2>&1 | ForEach-Object { $l = "$_"; Write-Host "  init: $l"; $l }); $script:rc = $LASTEXITCODE
     $ErrorActionPreference = $old
-    $script:initOut | ForEach-Object { "  init: $_" }
 }
 if (-not $init) { Emit 'INIT' "FAIL no init.sh (not next to this script; -InitUrl '$url' unreadable) -- in a WSL root console: $oneLiner"; return (Done) }
 $distroUp = [bool](Distros | Where-Object { $_.name -eq $script:D })
@@ -200,5 +258,9 @@ else { Emit 'INIT' "FAIL init.sh RESULT=$r rc=$($script:rc) -- in a WSL root con
 return (Done)
 }
 $script:exitCode = 0
+$LogFile = Join-Path $env:TEMP 'ws-bootstrap.log'
+try { Start-Transcript -Path $LogFile -Append -ErrorAction Stop | Out-Null; $tr = $true } catch { $tr = $false }
+Write-Host "-- log: $LogFile  (watch from another window: Get-Content -Wait '$LogFile')"
 Main
+if ($tr) { try { Stop-Transcript | Out-Null } catch {} }
 if ($PSCommandPath) { exit $script:exitCode }   # -File: rc; irm|iex: never close the console

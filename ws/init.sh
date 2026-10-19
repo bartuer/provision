@@ -6,9 +6,11 @@
 #   docker.io ca-certificates curl), DOCKERD (systemd -> enable --now; WSL without systemd -> [boot]
 #   systemd=true in /etc/wsl.conf + RESTART NEEDED, never restarts itself), GCM (git credential.helper ->
 #   the Windows Git Credential Manager under /mnt/c, so ADO auth pops on Windows), LFS (git lfs install),
-#   CLONE (cd / && git clone $WS_URL workspace + shallow single-branch submodules), INSTALL (./install.sh).
+#   CLONE (cd / && git clone $WS_URL workspace + submodule ssg_agent + git lfs pull; INIT_SUBMODULES=1 = every
+#   submodule, shallow single-branch -- build boxes only), INSTALL (./install.sh).
 # Last line RESULT=OK|PLAN|RESTART_NEEDED|REFUSED|FAIL.  rc: 0 OK/PLAN/RESTART_NEEDED, 1 FAIL, 2 REFUSED, 64 usage.
 # Env: WS_URL, INIT_ANY_OS=1, WS_DIR (/workspace), INIT_APPLY=1, INIT_SKIP_INSTALL=1, INIT_SKIP_SUBMODULES=1,
+#      INIT_SUBMODULES=1 (all submodules), INIT_SKIP_LFS=1,
 #      INIT_GCM (explicit helper exe), INIT_MNT (/mnt/c).
 # Idempotent: a 2nd --apply on a done box prints no `did` line.
 set -u
@@ -147,19 +149,35 @@ if ! command -v git >/dev/null 2>&1 || ! git lfs version >/dev/null 2>&1; then s
 elif git config --system --get filter.lfs.process >/dev/null 2>&1; then say LFS ok
 else act LFS "git lfs install --system" sh -c 'git lfs install --system >/dev/null'; fi
 
-# CLONE
+# CLONE (plan 01 Q.3): a user box = the workspace clone + `git lfs pull` (the bundles: AL tree, OA image
+# layers, services, datasets) + ONE submodule, ssg_agent (skills).  OfficeAgent / augloop-workflows /
+# lserver / tserver / wwwrootsdx are never checked out -- install.sh runs them from archive/.
+# INIT_SUBMODULES=1 = the build-box form (every submodule, shallow single-branch).
+# The clone skips the LFS smudge (one stream, ~4 MB/s) and `git lfs pull` fetches with
+# lfs.concurrenttransfers=8 instead.
+SUB_ARGS="--init --depth 1 --single-branch --jobs 6"
+sub_paths() { [ "${INIT_SUBMODULES:-0}" = 1 ] || echo ssg_agent; }
+sub_do() { git -C "$WS_DIR" submodule update $SUB_ARGS $(sub_paths); }
+lfs_do() {
+  [ "${INIT_SKIP_LFS:-0}" = 1 ] && return 0
+  git -C "$WS_DIR" config lfs.concurrenttransfers 8 && git -C "$WS_DIR" lfs pull
+}
 clone_do() {
   if [ "$ws_state" = empty ]; then rmdir "$WS_DIR" || return 1; fi
-  (cd "$(dirname "$WS_DIR")" && git clone -q "$WS_URL" "$(basename "$WS_DIR")") || return 1
-  [ "${INIT_SKIP_SUBMODULES:-0}" = 1 ] && return 0
-  sub_do
+  (cd "$(dirname "$WS_DIR")" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$WS_URL" "$(basename "$WS_DIR")") || return 1
+  git -C "$WS_DIR" config lfs.concurrenttransfers 8 || return 1
+  # Q.5: the public OA base (4.2 GB from mcr) downloads CONCURRENT with the LFS fetch; install.sh stage 9 awaits it
+  [ "${INIT_SKIP_LFS:-0}" = 1 ] || (cd "$WS_DIR" && ./install.sh --pull-base) >/dev/null 2>&1
+  if [ "${INIT_SKIP_SUBMODULES:-0}" != 1 ]; then sub_do || return 1; fi
+  lfs_do
 }
-sub_do() { git -C "$WS_DIR" submodule update --init --depth 1 --single-branch --jobs 6; }
-sub_missing() { [ "${INIT_SKIP_SUBMODULES:-0}" != 1 ] && git -C "$WS_DIR" submodule status 2>/dev/null | grep -q '^-'; }
+sub_missing() { [ "${INIT_SKIP_SUBMODULES:-0}" != 1 ] && git -C "$WS_DIR" submodule status $(sub_paths) 2>/dev/null | grep -q '^-'; }
+SUB_WHAT="$([ "${INIT_SUBMODULES:-0}" = 1 ] && echo "git submodule update $SUB_ARGS" || echo "git submodule update $SUB_ARGS ssg_agent")"
 if [ "$ws_state" = clone ]; then
-  if sub_missing; then act CLONE "git submodule update --init --depth 1 --single-branch --jobs 6 (resume)" sub_do || finish
+  if sub_missing; then resume_do() { sub_do && lfs_do; }
+  act CLONE "$SUB_WHAT (resume) + git lfs pull" resume_do || finish
   else say CLONE ok; fi
-else act CLONE "cd $(dirname "$WS_DIR") && git clone $WS_URL + git submodule update --init --depth 1 --single-branch --jobs 6" clone_do || finish; fi
+else act CLONE "cd $(dirname "$WS_DIR") && git clone $WS_URL + $SUB_WHAT + git lfs pull (lfs.concurrenttransfers=8)" clone_do || finish; fi
 
 # INSTALL
 if [ "${INIT_SKIP_INSTALL:-0}" = 1 ]; then say INSTALL "skip (INIT_SKIP_INSTALL=1)"
