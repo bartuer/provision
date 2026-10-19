@@ -413,11 +413,6 @@ function WslCfgSet($want) {   # CLEAN: .wslconfig becomes exactly the fleet file
     [IO.File]::WriteAllLines($f, [string[]]$out)   # no BOM: WSL ignores a .wslconfig that starts with one
     return $true
 }
-function RebootPending {   # Windows Update / CBS / file renames waiting for a reboot: half-applied network stack (WSL, GSA, Hyper-V switch)
-    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
-                   'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { if (Test-Path $k) { return $true } }
-    return $false
-}
 function FixWslNet {
     $desc = ($DevWslCfg.Keys | ForEach-Object { "$_=$($DevWslCfg[$_])" }) -join ' '
     $net = NetOk
@@ -436,8 +431,6 @@ function FixWslNet {
     }
     $changed = WslCfgSet $DevWslCfg   # always NAT; takes effect on the next VM start
     if ($net) { Emit 'WSLNET' ("ok net; .wslconfig {0}" -f $(if ($changed) { "set to [wsl2] $desc (applies on next WSL start; no restart now)" } else { "already [wsl2] $desc" })); $script:netOk = $true; return }
-    NetDiag
-    if (RebootPending) { Emit 'WSLNET' "FAIL WSL cannot reach archive.ubuntu.com and Windows has an update waiting for a REBOOT -- finish the update, reboot, then run this again"; $script:netOk = $false; return }
     $busy = @()
     foreach ($d in @(Distros | Where-Object { $_.state -eq 'Running' })) {
         $busy += @(Native 'wsl.exe' @('-d', $d.name, '-u', 'root', '-e', 'sh', '-c', 'command -v docker >/dev/null && docker ps -q 2>/dev/null; command -v tmux >/dev/null && tmux ls 2>/dev/null') -Timeout 30 | Where-Object { $_ -match '\S' })
@@ -450,18 +443,8 @@ function FixWslNet {
     Start-Sleep -Seconds 8
     $null = DistroVer
     if (NetOk) { Emit 'WSLNET' "did .wslconfig [wsl2] $desc + wsl --shutdown; net ok"; $script:netOk = $true; return }
-    NetDiag
-    # not fatal: init.sh's NET step still tries the host / public nameservers and prints net: lines if that fails too
-    Emit 'WSLNET' "WARN archive.ubuntu.com unreachable from WSL with [wsl2] $desc (Windows reaches it) -- init.sh will try other nameservers; net-diag lines above"; $script:netOk = $true
-}
-function NetDiag {   # why WSL cannot get out while Windows can: proxy, Hyper-V firewall, in-distro route + the real error
-    try { $ie = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -EA Stop
-          Write-Host "    net-diag: win proxy: enable=$($ie.ProxyEnable) server=$($ie.ProxyServer) pac=$($ie.AutoConfigURL)" } catch {}
-    try { Write-Host "    net-diag: winhttp: $(((netsh winhttp show proxy) | Where-Object { $_ -match '\S' } | Select-Object -Skip 1) -join ' ' -replace '\s+', ' ')" } catch {}
-    try { $fw = Get-NetFirewallHyperVVMSetting -PolicyStore ActiveStore -Name '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -EA Stop
-          Write-Host "    net-diag: hyperv-fw: enabled=$($fw.Enabled) outbound=$($fw.DefaultOutboundAction) inbound=$($fw.DefaultInboundAction)" } catch {}
-    try { Write-Host "    net-diag: win route: $((Find-NetRoute -RemoteIPAddress ((Resolve-DnsName archive.ubuntu.com -Type A -EA Stop | Where-Object IPAddress | Select-Object -First 1).IPAddress) -EA Stop | Where-Object InterfaceAlias | Select-Object -First 1).InterfaceAlias)" } catch {}
-    foreach ($l in @(InDistro 'echo "cfg: $(grep -v "^#" /etc/resolv.conf | tr "\n" " ")"; ip -4 -br addr | sed "s/^/addr: /"; ip -4 route | sed "s/^/route: /"; getent ahosts archive.ubuntu.com | head -2 | sed "s/^/resolve: /"; timeout 10 bash -c "exec 3<>/dev/tcp/archive.ubuntu.com/80" 2>&1 | tail -1 | sed "s/^/tcp: /"')) { if ("$l".Trim()) { Write-Host "    net-diag: $l" } }
+    # not fatal: init.sh's NET step reports it again before apt
+    Emit 'WSLNET' "WARN archive.ubuntu.com unreachable from WSL with [wsl2] $desc (Windows reaches it) -- check VPN / proxy"; $script:netOk = $true
 }
 $distroUp = [bool](Distros | Where-Object { $_.name -eq $script:D })
 if (-not $Apply) {

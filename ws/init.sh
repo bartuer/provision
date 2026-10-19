@@ -127,40 +127,21 @@ if dns_ok; then say DNS ok; else act DNS "fix /etc/resolv.conf (current resolver
 
 # NET -- DNS ok but "Network is unreachable": apt picked an IPv6 address the distro has no route for
 # (NAT WSL / Global Secure Access give IPv4 only).  Probe both families; pin apt to IPv4 when v6 fails.
-# Prints what it saw, so a still-broken network says WHY instead of apt's 50 Err lines.
 net_probe() {   # $1 = -4|-6 ; 0 = an HTTP answer came back
   if command -v curl >/dev/null 2>&1; then timeout 12 curl "$1" -sS -m 10 -o /dev/null http://archive.ubuntu.com/ubuntu/ 2>>/tmp/ws-net.err
   else timeout 12 bash -c "exec 3<>/dev/tcp/archive.ubuntu.com/80" 2>>/tmp/ws-net.err; fi
 }
-net_diag() {
-  echo "net: resolves to $(getent ahosts archive.ubuntu.com 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')" >&2
-  echo "net: v4 route: $(ip -4 route show default 2>/dev/null | head -1)  v6 route: $(ip -6 route show default 2>/dev/null | head -1)" >&2
-  echo "net: proxy env: ${http_proxy:-${HTTP_PROXY:-none}}; last error: $(tail -1 /tmp/ws-net.err 2>/dev/null)" >&2
-}
 net_do() {
   printf 'Acquire::ForceIPv4 "true";\n' > /etc/apt/apt.conf.d/99ws-ipv4
-  net_probe -4 && return 0
-  net_diag; return 1
-}
-net_dns() {   # Global Secure Access answers with synthetic 6.6.x.x addresses that only the Windows client can route:
-  # resolve through the host's / public DNS instead (this boot only; a WSL restart regenerates resolv.conf)
-  local c bak=/etc/resolv.conf.ws-net
-  cp -aL /etc/resolv.conf "$bak" 2>/dev/null || true
-  printf 'Acquire::ForceIPv4 "true";\n' > /etc/apt/apt.conf.d/99ws-ipv4
-  for c in ${INIT_DNS_WIN:-} 1.1.1.1 8.8.8.8; do
-    rm -f /etc/resolv.conf 2>/dev/null; printf 'nameserver %s\n' "$c" > /etc/resolv.conf
-    dns_ok && net_probe -4 && { echo "net: using nameserver $c -> $(getent ahosts archive.ubuntu.com | awk 'NR==1{print $1}')" >&2; return 0; }
-  done
-  cp -a "$bak" /etc/resolv.conf 2>/dev/null; return 1
+  net_probe -4
 }
 : > /tmp/ws-net.err
 if ! dns_ok; then say NET "skip (DNS not fixed yet)"
 elif command -v curl >/dev/null 2>&1 && net_probe -6; then say NET "ok (IPv6)"
 elif net_probe -4; then
   if [ -f /etc/apt/apt.conf.d/99ws-ipv4 ]; then say NET "ok (IPv4, apt pinned)"; else act NET "pin apt to IPv4 (IPv6 unreachable)" net_do || finish; fi
-elif [ "$APPLY" = 1 ] && net_dns; then say NET "did resolve via another nameserver + apt IPv4 (the WSL resolver gave an address WSL cannot reach)"
 else
-  net_diag; bad NET "archive.ubuntu.com:80 unreachable (see net: lines) -- Windows VPN / Global Secure Access / proxy blocks WSL"; finish
+  bad NET "archive.ubuntu.com:80 unreachable ($(tail -1 /tmp/ws-net.err 2>/dev/null)) -- Windows VPN / proxy blocks WSL"; finish
 fi
 
 # APT
