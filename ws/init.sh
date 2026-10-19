@@ -78,6 +78,34 @@ else
   say WS "ok $WS_DIR absent"
 fi
 
+# USER -- the WSL login user (`wsl --install --no-launch` skips Ubuntu's first-run, so none exists and wsl logs
+# in as root).  INIT_USER (the bootstrap passes the Windows user name): create it (uid 1000 on a fresh distro,
+# groups sudo + docker after APT), make it the [user] default in /etc/wsl.conf, and on a tty ask its password.
+U="${INIT_USER:-}"
+wslconf_set() {   # wslconf_set SECTION KEY VALUE -- every other line kept
+  local f=/etc/wsl.conf t; t="$(mktemp)"
+  if grep -qiE "^[[:space:]]*\[$1\]" "$f" 2>/dev/null; then
+    awk -v s="[$1]" -v k="$2" -v v="$3" 'tolower($1)==s{print; print k"="v; ins=1; next}
+         /^[[:space:]]*\[/{ins=0} ins && $0 ~ "^[[:space:]]*"k"[[:space:]]*="{next} {print}' "$f" > "$t"
+  else { [ -s "$f" ] && cat "$f" && echo; printf '[%s]\n%s=%s\n' "$1" "$2" "$3"; } > "$t"; fi
+  cat "$t" > "$f"; rm -f "$t"
+}
+user_do() {
+  id "$U" >/dev/null 2>&1 || useradd -m -s /bin/bash -G sudo "$U" || return 1
+  wslconf_set user default "$U"
+  if [ -t 0 ] && [ -t 1 ]; then
+    echo "== set the password for WSL user '$U' (used by sudo) =="
+    until passwd "$U"; do echo "try again"; done
+  fi
+}
+user_ok() { id "$U" >/dev/null 2>&1 && grep -qE "^[[:space:]]*default[[:space:]]*=[[:space:]]*$U[[:space:]]*$" /etc/wsl.conf 2>/dev/null; }
+if [ -z "$U" ]; then say USER "skip (no INIT_USER)"
+elif ! printf '%s' "$U" | grep -qE '^[a-z][a-z0-9_-]{0,31}$'; then bad USER "bad name '$U'"
+elif user_ok; then
+  if [ "$APPLY" = 1 ] && [ -t 0 ] && [ -t 1 ] && passwd -S "$U" 2>/dev/null | grep -qE "^$U (L|NP) "; then act USER "passwd $U" user_do
+  else say USER "ok $U"; fi
+else act USER "useradd $U (sudo), /etc/wsl.conf [user] default=$U, passwd" user_do; fi
+
 # APT
 missing=""
 have_pkg() {   # a tool already on PATH counts (docker-ce instead of docker.io, a source-built git)
@@ -90,12 +118,21 @@ have_pkg() {   # a tool already on PATH counts (docker-ce instead of docker.io, 
   dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'ok installed'
 }
 for p in $PKGS; do have_pkg "$p" || missing="$missing $p"; done
-apt_do() {
-  apt-get update -qq >/dev/null 2>&1
-  # shellcheck disable=SC2086
-  apt-get install -y -qq --no-install-recommends $missing >/dev/null 2>&1
+apt_do() {   # on a tty (the bootstrap's Ubuntu window): apt's own progress; else quiet
+  if [ -t 1 ]; then
+    apt-get update && apt-get install -y --no-install-recommends $missing   # shellcheck disable=SC2086
+  else
+    apt-get update -qq >/dev/null 2>&1
+    # shellcheck disable=SC2086
+    apt-get install -y -qq --no-install-recommends $missing >/dev/null 2>&1
+  fi
 }
 if [ -z "$missing" ]; then say APT ok; else act APT "apt-get install$missing" apt_do || finish; fi
+
+# the login user may run docker
+if [ "$APPLY" = 1 ] && [ -n "$U" ] && id "$U" >/dev/null 2>&1 && getent group docker >/dev/null && ! id -nG "$U" | grep -qw docker; then
+  usermod -aG docker "$U" && say DOCKERGRP "did usermod -aG docker $U"
+fi
 
 # DOCKERD
 docker_up()      { command -v docker >/dev/null 2>&1 && docker info --format '{{.ServerVersion}}' >/dev/null 2>&1; }
@@ -155,7 +192,7 @@ else act LFS "git lfs install --system" sh -c 'git lfs install --system >/dev/nu
 # INIT_SUBMODULES=1 = the build-box form (every submodule, shallow single-branch).
 # The clone skips the LFS smudge (one stream, ~4 MB/s) and `git lfs pull` fetches with
 # lfs.concurrenttransfers=8 instead.
-SUB_ARGS="--init --depth 1 --single-branch --jobs 6"
+SUB_ARGS="--init --progress --depth 1 --single-branch --jobs 6"
 sub_paths() { [ "${INIT_SUBMODULES:-0}" = 1 ] || echo ssg_agent; }
 sub_do() { git -C "$WS_DIR" submodule update $SUB_ARGS $(sub_paths); }
 lfs_do() {
@@ -164,7 +201,7 @@ lfs_do() {
 }
 clone_do() {
   if [ "$ws_state" = empty ]; then rmdir "$WS_DIR" || return 1; fi
-  (cd "$(dirname "$WS_DIR")" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$WS_URL" "$(basename "$WS_DIR")") || return 1
+  (cd "$(dirname "$WS_DIR")" && GIT_LFS_SKIP_SMUDGE=1 git clone --progress "$WS_URL" "$(basename "$WS_DIR")") || return 1
   git -C "$WS_DIR" config lfs.concurrenttransfers 8 || return 1
   # Q.5: the public OA base (4.2 GB from mcr) downloads CONCURRENT with the LFS fetch; install.sh stage 9 awaits it
   [ "${INIT_SKIP_LFS:-0}" = 1 ] || (cd "$WS_DIR" && ./install.sh --pull-base) >/dev/null 2>&1

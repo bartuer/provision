@@ -15,9 +15,9 @@
               `winget install -e --id Microsoft.GitCredentialManagerCore`
       INIT    init.sh (next to this file, else -InitUrl) run as root in the distro: dry-run -> its own dry
               run is shown as `  init: ...` lines; real run -> `init.sh --apply`.  On failure the one-liner to
-              paste in a WSL root console is printed.
+              re-run is this same bootstrap (everything is idempotent).
     A distro restart (init.sh says RESTART_NEEDED: systemd was just enabled) is a separate gate
-    -AllowRestart, done with `wsl --terminate <distro>` -- never `wsl --shutdown`.  It is refused (the
+    done here automatically with `wsl --terminate <distro>` -- never `wsl --shutdown`.  It is refused (the
     command is printed for the user instead) when this script runs from inside WSL or when the distro has
     running containers or tmux sessions.
 
@@ -34,11 +34,12 @@ param(
     [switch] $AllowRestart = ($env:WS_ALLOW_RESTART -eq '1'),
     [string] $Distro  = "$env:WS_DISTRO",
     [string] $WsUrl   = 'https://dev.azure.com/MSRADKI/Excel/_git/workspace',
-    [string] $InitUrl = ''
+    [string] $InitUrl = '',
+    [string] $User    = "$env:WS_USER"                          # WSL login user; default = the Windows user name
 )
 $ErrorActionPreference = 'Stop'
 $Apply = -not $DryRun
-Remove-Item Env:WS_DRY, Env:WS_ALLOW_RESTART, Env:WS_DISTRO -ErrorAction SilentlyContinue   # one-shot: a dry run must not stick to the next plain line
+Remove-Item Env:WS_DRY, Env:WS_ALLOW_RESTART, Env:WS_DISTRO, Env:WS_USER -ErrorAction SilentlyContinue   # one-shot: a dry run must not stick to the next plain line
 $env:WSL_UTF8 = '1'                       # wsl.exe management output in UTF-8 (older WSL: UTF-16, NULs stripped below)
 $DefaultInitUrl = 'https://raw.githubusercontent.com/bartuer/provision/main/ws/init.sh'                      # set by bin/gist-publish.sh to the gist raw init.sh URL (G.4)
 $NewDistro      = 'Ubuntu-26.04'            # the fleet release (wsl --list --online name)
@@ -193,21 +194,47 @@ $v = DistroVer
 if ($v -eq "ubuntu $WantVersion") { Emit 'WSL' "ok $($script:D) WSL2 ($v)" }
 else { Emit 'WSL' "FAIL $($script:D) reports '$v', the fleet needs ubuntu $WantVersion (rc=$($script:rc))"; return (Done) }
 
-# GIT
-if (Get-Command git.exe -ErrorAction SilentlyContinue) { Emit 'GIT' 'ok' }
-elseif (-not $Apply) { Emit 'GIT' 'WOULD winget install -e --id Git.Git' }
-else { Step 'GIT: winget install Git.Git (timeout 30 min)'
-       Live 'winget.exe' -a @('install', '-e', '--id', 'Git.Git', '--silent', '--accept-package-agreements', '--accept-source-agreements')
-       RefreshPath
-       if (Get-Command git.exe -ErrorAction SilentlyContinue) { Emit 'GIT' 'did winget install Git.Git' } else { Emit 'GIT' "FAIL winget install Git.Git rc=$($script:rc)" } }
+# GIT -- Git for Windows (brings GCM).  winget is pinned to `--source winget`: a fresh devbox's msstore source
+# fails the search ("Failed when searching source: msstore ... No packages were found").  winget absent or
+# failing -> the installer straight from github.com/git-for-windows releases (BITS download, progress bar).
+function HaveGit { RefreshPath; [bool](Get-Command git.exe -ErrorAction SilentlyContinue) }
+function GitDirect {
+    Step 'GIT: download the Git for Windows installer (github.com/git-for-windows/git, latest release)'
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $rel = Invoke-RestMethod -UseBasicParsing 'https://api.github.com/repos/git-for-windows/git/releases/latest'
+        $asset = $rel.assets | Where-Object { $_.name -match '^Git-[\d.]+(\.\d+)?-64-bit\.exe$' } | Select-Object -First 1
+        if (-not $asset) { Write-Host '  git: no 64-bit installer in the latest release'; return }
+        $exe = Join-Path $env:TEMP $asset.name
+        try { Start-BitsTransfer -Source $asset.browser_download_url -Destination $exe -DisplayName "download $($asset.name)" -ErrorAction Stop }
+        catch { Write-Host "  git: BITS failed ($_), plain download"; (New-Object Net.WebClient).DownloadFile($asset.browser_download_url, $exe) }
+    } catch { Write-Host "  git: download failed: $_"; return }
+    Step "GIT: $($asset.name) /SILENT (its own progress window)"
+    Live $exe @('/SILENT', '/NORESTART', '/NOCANCEL', '/SP-', '/SUPPRESSMSGBOXES', '/COMPONENTS=gitlfs') -What "install $($asset.name)" -Timeout 1200
+    Remove-Item $exe -ErrorAction SilentlyContinue
+}
+if (HaveGit) { Emit 'GIT' 'ok' }
+elseif (-not $Apply) { Emit 'GIT' 'WOULD winget install -e --id Git.Git --source winget, else the github.com/git-for-windows installer' }
+else {
+    $how = ''
+    if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
+        Step 'GIT: winget install Git.Git --source winget (timeout 15 min)'
+        Live 'winget.exe' -a @('install', '-e', '--id', 'Git.Git', '--source', 'winget', '--silent', '--accept-package-agreements', '--accept-source-agreements') -Timeout 900
+        if (HaveGit) { $how = 'winget install Git.Git' }
+    }
+    if (-not $how) { GitDirect; if (HaveGit) { $how = 'Git for Windows installer (github release)' } }
+    if ($how) { Emit 'GIT' "did $how" } else { Emit 'GIT' "FAIL git.exe still absent after winget and the direct installer (rc=$($script:rc)) -- log: $LogFile" }
+}
 
 # GCM
 $gcmOk = $false
-if (Get-Command git.exe -ErrorAction SilentlyContinue) { Native 'git.exe' @('credential-manager', '--version') | Out-Null; $gcmOk = ($script:rc -eq 0) }
+$gitOk = [bool](Get-Command git.exe -ErrorAction SilentlyContinue)
+if ($gitOk) { Native 'git.exe' @('credential-manager', '--version') | Out-Null; $gcmOk = ($script:rc -eq 0) }
 if ($gcmOk) { Emit 'GCM' 'ok' }
+elseif (-not $gitOk -and $Apply) { Emit 'GCM' 'FAIL needs git.exe (see GIT)' }
 elseif (-not $Apply) { Emit 'GCM' 'WOULD (ships with Git for Windows) else winget install -e --id Microsoft.GitCredentialManagerCore' }
 else { Step 'GCM: winget install Microsoft.GitCredentialManagerCore (timeout 30 min)'
-       Live 'winget.exe' -a @('install', '-e', '--id', 'Microsoft.GitCredentialManagerCore', '--silent', '--accept-package-agreements', '--accept-source-agreements')
+       Live 'winget.exe' -a @('install', '-e', '--id', 'Microsoft.GitCredentialManagerCore', '--source', 'winget', '--silent', '--accept-package-agreements', '--accept-source-agreements')
        RefreshPath; Native 'git.exe' @('credential-manager', '--version') | Out-Null
        if ($script:rc -eq 0) { Emit 'GCM' 'did winget install GitCredentialManagerCore' } else { Emit 'GCM' 'FAIL git credential-manager still absent' } }
 
@@ -218,25 +245,46 @@ $url = $(if ($InitUrl) { $InitUrl } else { $DefaultInitUrl })
 $src = ''; $init = $null
 if ($local -and (Test-Path $local)) { $src = $local; $init = [IO.File]::ReadAllText($local) }
 elseif ($url) { $src = $url; try { $init = (Invoke-RestMethod -UseBasicParsing $url) } catch { $init = $null } }
+if (-not $User) { $User = "$env:USERNAME".ToLower() -replace '[^a-z0-9_-]', '' }
+if ($User -notmatch '^[a-z][a-z0-9_-]{0,31}$') { $User = 'dev' }
 $oneLiner = $(if ($url) { "curl -fsSL '$url' | WS_URL='$WsUrl' bash -s -- --apply" } else { "WS_URL='$WsUrl' bash init.sh --apply   # init.sh from the bootstrap gist" })
 function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding mangling), stdin left to the console
     $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($init -replace "`r`n", "`n")))
-    $cmd = "echo $b64 | base64 -d > /tmp/ws-init.sh && WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode; rc=`$?; rm -f /tmp/ws-init.sh; exit `$rc"
+    $cmd = "echo $b64 | base64 -d > /tmp/ws-init.sh && INIT_USER='$User' WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode; rc=`$?; rm -f /tmp/ws-init.sh; exit `$rc"
     $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    if ($mode -eq '--apply') {   # long (apt, clone, lfs, install.sh): ON THE CONSOLE so git/apt draw their progress bars;
-        # stdout is tee'd to /tmp/ws-init.out to read RESULT= back, stderr (where git prints progress) stays on the tty
+    if ($mode -eq '--apply') {   # long (apt, clone + ADO auth, lfs, install.sh): run in its OWN Ubuntu window = a real tty,
+        # so apt / git clone / lfs draw their native progress and a credential prompt can be answered there.
+        # `script` keeps the pty AND logs to /tmp/ws-init.out; this window shows a progress bar + the last log line.
         $ErrorActionPreference = $old
-        $cmd = "echo $b64 | base64 -d > /tmp/ws-init.sh && WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode | tee /tmp/ws-init.out; rc=`${PIPESTATUS[0]}; rm -f /tmp/ws-init.sh; exit `$rc"
-        Step "INIT: init.sh --apply as root in $($script:D) (apt / git clone / install.sh progress below)"
-        Live 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', $cmd) -Timeout 7200 -What "init.sh --apply in $($script:D)"
-        $rc0 = $script:rc; $script:initOut = @(InDistro 'cat /tmp/ws-init.out 2>/dev/null'); $script:rc = $rc0
+        $run = "rm -f /tmp/ws-init.out; echo $b64 | base64 -d > /tmp/ws-init.sh; " +
+               "export INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
+               "else WS_URL='$WsUrl' bash /tmp/ws-init.sh --apply 2>&1 | tee /tmp/ws-init.out; fi; rc=`$?; rm -f /tmp/ws-init.sh; " +
+               "if [ `$rc != 0 ]; then echo; echo 'init.sh FAILED (rc='`$rc') -- see the FAIL line above; press Enter to close'; read x; fi; exit `$rc"
+        Step "INIT: init.sh --apply as root in a NEW Ubuntu window ($($script:D)) -- type the password for WSL user '$User' there, then watch apt / git clone / sign-in"
+        $path = (Get-Command wsl.exe).Source
+        $p = Start-Process -FilePath $path -ArgumentList ((@('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', $run) | ForEach-Object { Q $_ }) -join ' ') -PassThru
+        $null = $p.Handle
+        $sw = [Diagnostics.Stopwatch]::StartNew(); $tail = ''
+        while (-not $p.WaitForExit(5000)) {
+            $t = [int]$sw.Elapsed.TotalSeconds
+            $tl = & wsl.exe -d $script:D -u root -e sh -c "tail -c 4000 /tmp/ws-init.out 2>/dev/null | tr '\r' '\n' | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | grep -v '^[[:space:]]*$' | tail -n 1" 2>$null
+            if ($tl) { $tail = ("$tl" -replace "`0", '').Trim() }
+            if ($tail.Length -gt 100) { $tail = $tail.Substring(0, 100) }
+            Write-Progress -Activity 'init.sh --apply (in the Ubuntu window)' -Status ("{0}m{1:d2}s  {2}" -f [int][math]::Floor($t / 60), ($t % 60), $tail) -PercentComplete -1
+            if ($t -gt 7200) { try { $p.Kill() } catch {}; Write-Host '  init: TIMEOUT after 2h -- killed'; break }
+        }
+        $p.WaitForExit(); Write-Progress -Activity 'init.sh --apply (in the Ubuntu window)' -Completed
+        $script:rc = $p.ExitCode
+        $script:initOut = @(& wsl.exe -d $script:D -u root -e sh -c "tr '\r' '\n' < /tmp/ws-init.out 2>/dev/null | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | grep -E '^[A-Z_]+='" 2>$null | ForEach-Object { ("$_" -replace "`0", '').Trim() } | Where-Object { $_ })
+        foreach ($l in $script:initOut) { Write-Host "  init: $l" }
+        Write-Host ("  init: rc={0} in {1}s  (full log in the distro: /tmp/ws-init.out)" -f $script:rc, [int]$sw.Elapsed.TotalSeconds)
         return
     }
     Step "INIT: init.sh $mode as root in $($script:D) (live output below)"
     $script:initOut = @(& wsl.exe -d $script:D -u root -e bash -c $cmd 2>&1 | ForEach-Object { $l = "$_"; Write-Host "  init: $l"; $l }); $script:rc = $LASTEXITCODE
     $ErrorActionPreference = $old
 }
-if (-not $init) { Emit 'INIT' "FAIL no init.sh (not next to this script; -InitUrl '$url' unreadable) -- in a WSL root console: $oneLiner"; return (Done) }
+if (-not $init) { Emit 'INIT' "FAIL could not download init.sh from $url -- check the network, then run this bootstrap again"; return (Done) }
 $distroUp = [bool](Distros | Where-Object { $_.name -eq $script:D })
 if (-not $Apply) {
     if ($distroUp) { RunInit '--dry-run' }
@@ -248,7 +296,6 @@ RunInit '--apply'
 $r = ($script:initOut | Where-Object { $_ -match '^RESULT=' } | Select-Object -Last 1) -replace '^RESULT=', ''
 if ($r -eq 'RESTART_NEEDED') {
     $restartCmd = "wsl --terminate $($script:D)"
-    if (-not $AllowRestart) { Emit 'INIT' "RESTART NEEDED -- run: $restartCmd ; then run this again (or pass -AllowRestart)"; return (Done 'RESTART_NEEDED') }
     if (InWsl) { Emit 'RESTART' "REFUSE running from inside WSL -- from a Windows PowerShell run: $restartCmd ; then run this again"; return (Done 'REFUSED') }
     $busy = @(InDistro 'command -v docker >/dev/null && docker ps -q 2>/dev/null; command -v tmux >/dev/null && tmux ls 2>/dev/null' | Where-Object { $_ -match '\S' })
     if ($busy.Count) { Emit 'RESTART' "REFUSE $($script:D) has running containers/tmux ($($busy.Count)) -- stop them, then: $restartCmd"; return (Done 'REFUSED') }
@@ -258,7 +305,11 @@ if ($r -eq 'RESTART_NEEDED') {
     $r = ($script:initOut | Where-Object { $_ -match '^RESULT=' } | Select-Object -Last 1) -replace '^RESULT=', ''
 }
 if ($r -eq 'OK') { Emit 'INIT' "ok init.sh --apply in $($script:D)" }
-else { Emit 'INIT' "FAIL init.sh RESULT=$r rc=$($script:rc) -- in a WSL root console (wsl -d $($script:D) -u root): $oneLiner" }
+else {
+    $why = @($script:initOut | Where-Object { $_ -match '=FAIL' }) -join '; '
+    if (-not $why) { $why = "RESULT=$r rc=$($script:rc)" }
+    Emit 'INIT' "FAIL $why -- fix that, then re-run this bootstrap (init.sh is idempotent: it does the git clone itself and skips what is done; log: wsl -d $($script:D) -u root cat /tmp/ws-init.out)"
+}
 return (Done)
 }
 $script:exitCode = 0
