@@ -399,49 +399,36 @@ if (-not $init) { Emit 'INIT' "FAIL could not download init.sh from $url -- chec
 # the services.  The file is always written (other keys kept, backup .ws-bak); it takes effect only on
 # the next VM start.  `wsl --shutdown` runs ONLY when DNS is broken now AND nothing is running.
 $FleetWslCfg = [ordered]@{ networkingMode = 'mirrored'; vmIdleTimeout = '-1' }
-function DnsOk { $o = InDistro 'timeout 6 getent ahosts archive.ubuntu.com >/dev/null 2>&1 && echo DNSOK'; return [bool]($o -match 'DNSOK') }
-function WslCfgSet($want) {   # $want: [ordered] or plain hashtable
-      # returns $true if .wslconfig changed; keeps every other line
+function NetOk {   # DNS AND a TCP connect to archive.ubuntu.com:80 -- "resolves but Network is unreachable" is NOT ok
+    $o = InDistro 'timeout 6 getent ahosts archive.ubuntu.com >/dev/null 2>&1 || exit; timeout 10 bash -c "exec 3<>/dev/tcp/archive.ubuntu.com/80" 2>/dev/null && echo NETOK'
+    return [bool]($o -match 'NETOK')
+}
+function WslCfgSet($want) {   # CLEAN: .wslconfig becomes exactly the fleet file ([wsl2] + $want, nothing else); returns $true if it changed
+    # Extra keys from manual tries (dnsTunneling, firewall, [experimental], proxies) are what broke devboxes:
+    # with Global Secure Access, WSL disables DNS tunneling anyway, and mirrored is what every fleet box runs.
     $f = Join-Path $env:USERPROFILE '.wslconfig'
-    $lines = @(); if (Test-Path $f) { $lines = @(Get-Content $f) }
-    $out = New-Object System.Collections.Generic.List[string]; $sec = ''; $seen = @{}; $inW = $false; $changed = $false
-    foreach ($l in $lines) {
-        if ($l -match '^\s*\[(.+)\]\s*$') {
-            if ($inW) { foreach ($k in $want.Keys) { if (-not $seen[$k]) { $out.Add("$k=$($want[$k])"); $seen[$k] = 1; $changed = $true } } }
-            $sec = $Matches[1].Trim().ToLower(); $inW = ($sec -eq 'wsl2'); $out.Add($l); continue
-        }
-        if ($inW -and $l -match '^\s*([A-Za-z]+)\s*=\s*(.*?)\s*$' -and ($want.Keys -contains $Matches[1])) {
-            $k = $Matches[1]; $seen[$k] = 1
-            if ($Matches[2] -ne $want[$k]) { $out.Add("$k=$($want[$k])"); $changed = $true } else { $out.Add($l) }
-            continue
-        }
-        $out.Add($l)
-    }
-    if ($inW) { foreach ($k in $want.Keys) { if (-not $seen[$k]) { $out.Add("$k=$($want[$k])"); $seen[$k] = 1; $changed = $true } } }
-    if (-not ($lines | Where-Object { $_ -match '^\s*\[wsl2\]\s*$' })) {
-        $out.Insert(0, '[wsl2]'); $i = 1; foreach ($k in $want.Keys) { $out.Insert($i, "$k=$($want[$k])"); $i++ }; $changed = $true
-    }
-    if ($changed) {
-        if (Test-Path $f) { Copy-Item $f "$f.ws-bak" -Force }
-        [IO.File]::WriteAllLines($f, $out.ToArray())   # no BOM: WSL ignores a .wslconfig that starts with one
-    }
-    return $changed
+    $out = @('[wsl2]') + @($want.Keys | ForEach-Object { "$_=$($want[$_])" })
+    $cur = @(); if (Test-Path $f) { $cur = @(Get-Content $f | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }) }
+    if (($cur -join "`n") -eq ($out -join "`n")) { return $false }
+    if (Test-Path $f) { Copy-Item $f "$f.ws-bak" -Force; foreach ($l in $cur) { Write-Host "    wslconfig-old: $l" } }
+    [IO.File]::WriteAllLines($f, [string[]]$out)   # no BOM: WSL ignores a .wslconfig that starts with one
+    return $true
 }
 function FixWslNet {
     $desc = ($FleetWslCfg.Keys | ForEach-Object { "$_=$($FleetWslCfg[$_])" }) -join ' '
-    $dns = DnsOk
+    $dns = NetOk
     if (-not $Apply) {
-        Emit 'WSLNET' ("{0} .wslconfig [wsl2] $desc{1}" -f $(if ($dns) { 'ok DNS;' } else { 'WOULD set' }), $(if ($dns) { ' (set if missing, applies on next WSL start)' } else { ' + wsl --shutdown (the distro cannot resolve names)' }))
+        Emit 'WSLNET' ("{0} .wslconfig [wsl2] $desc{1}" -f $(if ($dns) { 'ok net;' } else { 'WOULD clean' }), $(if ($dns) { ' (exactly this, applies on next WSL start)' } else { ' + wsl --shutdown (the distro cannot reach archive.ubuntu.com)' }))
         $script:netOk = $true; return
     }
     if (InWsl) {
-        if ($dns) { Emit 'WSLNET' "ok DNS (running inside WSL: .wslconfig not checked)"; $script:netOk = $true }
-        else { Emit 'WSLNET' "REFUSE distro DNS is broken; from Windows PowerShell set .wslconfig [wsl2] $desc and run wsl --shutdown"; $script:netOk = $false }
+        if ($dns) { Emit 'WSLNET' "ok net (running inside WSL: .wslconfig not checked)"; $script:netOk = $true }
+        else { Emit 'WSLNET' "REFUSE distro network is broken; from Windows PowerShell set .wslconfig [wsl2] $desc and run wsl --shutdown"; $script:netOk = $false }
         return
     }
     $changed = WslCfgSet $FleetWslCfg
     if ($dns) {
-        Emit 'WSLNET' ("ok DNS; .wslconfig {0}" -f $(if ($changed) { "set $desc (applies on next WSL start; no restart now)" } else { 'already fleet' }))
+        Emit 'WSLNET' ("ok net; .wslconfig {0}" -f $(if ($changed) { "cleaned to $desc (applies on next WSL start; no restart now)" } else { 'already fleet' }))
         $script:netOk = $true; return
     }
     foreach ($l in @(InDistro "echo resolv: `$(grep -v '^#' /etc/resolv.conf 2>/dev/null | tr '\n' ' '); ls -l /etc/resolv.conf 2>&1 | sed 's/^/resolv-link: /'; grep -A1 '^\[network\]' /etc/wsl.conf 2>/dev/null | tr '\n' ' ' | sed 's/^/wsl.conf: /'; echo; ip -4 route show default 2>&1 | sed 's/^/route: /'")) { if ("$l".Trim()) { Write-Host "    dns-diag: $l" } }
@@ -449,15 +436,15 @@ function FixWslNet {
     foreach ($d in @(Distros | Where-Object { $_.state -eq 'Running' })) {
         $busy += @(Native 'wsl.exe' @('-d', $d.name, '-u', 'root', '-e', 'sh', '-c', 'command -v docker >/dev/null && docker ps -q 2>/dev/null; command -v tmux >/dev/null && tmux ls 2>/dev/null') -Timeout 30 | Where-Object { $_ -match '\S' })
     }
-    if ($busy.Count) { Emit 'WSLNET' "REFUSE distro DNS is broken; .wslconfig is fleet ($desc) but running containers/tmux ($($busy.Count)) block the restart -- stop them, then: wsl --shutdown ; and run this again"; $script:netOk = $false; return }
-    Step "WSLNET: distro DNS is broken; .wslconfig [wsl2] $desc; restarting the WSL VM (wsl --shutdown) -- nothing was running"
-    # undo an earlier init.sh DNS pin (static resolv.conf + generateResolvConf=false): it would override mirrored DNS
-    $null = InDistro "if grep -q '^generateResolvConf = false' /etc/wsl.conf 2>/dev/null; then sed -i '/^\[network\]$/{N;/generateResolvConf = false/d}' /etc/wsl.conf; rm -f /etc/resolv.conf; fi"
+    if ($busy.Count) { Emit 'WSLNET' "REFUSE distro network is broken; .wslconfig is fleet ($desc) but running containers/tmux ($($busy.Count)) block the restart -- stop them, then: wsl --shutdown ; and run this again"; $script:netOk = $false; return }
+    Step "WSLNET: distro network is broken; .wslconfig = [wsl2] $desc only; restarting the WSL VM (wsl --shutdown) -- nothing was running"
+    # clean the distro side too: earlier DNS pins (static resolv.conf, [network] generateResolvConf=false) override WSL's own DNS
+    $null = InDistro "sed -i '/^generateResolvConf/d' /etc/wsl.conf 2>/dev/null; [ -L /etc/resolv.conf ] || rm -f /etc/resolv.conf"
     Native 'wsl.exe' @('--shutdown') -Timeout 60 | Out-Null
     Start-Sleep -Seconds 8
     $null = DistroVer
-    if (DnsOk) { Emit 'WSLNET' "did .wslconfig $desc + wsl --shutdown; DNS ok"; $script:netOk = $true; return }
-    Emit 'WSLNET' "FAIL still no DNS with the fleet .wslconfig ($desc) after a restart -- check the VPN / Global Secure Access client"; $script:netOk = $false
+    if (NetOk) { Emit 'WSLNET' "did clean .wslconfig ($desc) + distro DNS pins + wsl --shutdown; net ok"; $script:netOk = $true; return }
+    Emit 'WSLNET' "FAIL archive.ubuntu.com still unreachable with the clean fleet .wslconfig ($desc) after a restart -- Windows side: Global Secure Access / VPN / proxy (try the same URL in a Windows browser)"; $script:netOk = $false
 }
 $distroUp = [bool](Distros | Where-Object { $_.name -eq $script:D })
 if (-not $Apply) {
