@@ -3,7 +3,7 @@
 #   bash init.sh            dry-run (DEFAULT): prints KEY=ok|WOULD <action>|FAIL <why>, changes nothing
 #   bash init.sh --apply    (or INIT_APPLY=1) does the work; acted steps print KEY=did <action>
 # Steps: ROOT, OS (ubuntu 26.04), WS (refuse a foreign /workspace -- checked first, before anything changes), APT (git git-lfs
-#   docker.io ca-certificates curl), DOCKERD (systemd -> enable --now; WSL without systemd -> [boot]
+#   docker.io ca-certificates curl jq), DOCKERD (systemd -> enable --now; WSL without systemd -> [boot]
 #   systemd=true in /etc/wsl.conf + RESTART NEEDED, never restarts itself), GCM (git credential.helper ->
 #   the Windows Git Credential Manager under /mnt/c, so ADO auth pops on Windows), LFS (git lfs install),
 #   CLONE (cd / && git clone $WS_URL workspace + submodule ssg_agent + git lfs pull; INIT_SUBMODULES=1 = every
@@ -20,7 +20,7 @@ WS_URL="${WS_URL:-https://dev.azure.com/MSRADKI/Excel/_git/workspace}"
 WS_DIR="${WS_DIR:-/workspace}"
 APPLY="${INIT_APPLY:-0}"
 MNT="${INIT_MNT:-/mnt/c}"
-PKGS="git git-lfs docker.io ca-certificates curl"
+PKGS="git git-lfs docker.io ca-certificates curl jq"
 for a in "$@"; do
   case "$a" in
     --apply) APPLY=1 ;;
@@ -148,6 +148,19 @@ write_wslconf() {   # systemd=true under [boot]; every other line kept
   fi
   cat "$t" > "$f"; rm -f "$t"
 }
+# DOCKERCFG: dockerd pulls 3 layers at a time by default; the OA base is 36 layers (one 1.1 GB) -> 16 like LFS
+DOCKER_JOBS="${INIT_DOCKER_JOBS:-16}"
+dockercfg_ok() { grep -q '"max-concurrent-downloads"' /etc/docker/daemon.json 2>/dev/null; }
+dockercfg_do() {   # only creates a MISSING daemon.json; restarts dockerd only when it runs no container
+  mkdir -p /etc/docker && printf '{\n  "max-concurrent-downloads": %s\n}\n' "$DOCKER_JOBS" > /etc/docker/daemon.json || return 1
+  if docker_up && has_systemd; then
+    if [ -z "$(docker ps -q 2>/dev/null)" ]; then systemctl restart docker.service >/dev/null 2>&1
+    else echo "DOCKERCFG: containers running -- dockerd keeps 3 until its next restart"; fi
+  fi
+}
+if dockercfg_ok; then say DOCKERCFG ok
+elif [ -e /etc/docker/daemon.json ]; then say DOCKERCFG "WARN /etc/docker/daemon.json exists without max-concurrent-downloads -- left alone (pulls 3 layers at a time)"
+else act DOCKERCFG "/etc/docker/daemon.json max-concurrent-downloads=$DOCKER_JOBS (default 3)" dockercfg_do; fi
 if docker_up; then say DOCKERD ok
 elif has_systemd; then
   act DOCKERD "systemctl enable --now docker" sh -c 'systemctl enable --now docker.service >/dev/null 2>&1'
@@ -247,16 +260,30 @@ lfs_status() {   # dir map n t0 [tag]: files done, GB, MB/s since t0, bytes in f
     'BEGIN { printf "LFS %s: %d/%d files, %.2f GB, %.1f MB/s, %dm%02ds\n", tag, d, n, (g+f)/1073741824, (g+f-g0)/1048576/el, el/60, el%60 }'
 }
 oa_pull_status() {   # one line: background docker pull of the OA base (install.sh --pull-base)
-  local L=/tmp/ws-oa-pull.log t0 n c mb
+  local L=/tmp/ws-oa-pull.log t0 n c mb gb
   [ -s "$L" ] || return 0
-  t0="$(sed -n 's/^t0=\([0-9]*\).*/\1/p' "$L" | head -1)"
   if grep -q '^rc=' "$L"; then echo "OA base pull: $(grep '^rc=' "$L" | tail -1)"; return 0; fi
-  n="$(grep -c ': Pulling fs layer' "$L")"; c="$(grep -c ': Pull complete' "$L")"
+  t0="$(sed -n 's/^t0=\([0-9]*\).*/\1/p' "$L" | head -1)"
+  n="$(grep -c . "$L.map" 2>/dev/null)"; c="$(oa_layers_done | grep -c .)"
+  gb="$(awk -F'\t' '{s+=$2} END {printf "%.2f", s/1073741824}' "$L.map" 2>/dev/null)"
   mb="$(du -sm /var/lib/containerd/io.containerd.content.v1.content/ingest 2>/dev/null | cut -f1)"
-  echo "OA base pull: layers $c/$n done, ${mb:-?} MB in flight, $(( ($(date +%s) - ${t0:-$(date +%s)}) / 60 ))m (background, shares bandwidth)"
+  echo "OA base pull: ${c}/${n:-?} layers of ${gb:-?} GB, ${mb:-?} MB in flight, $(( ($(date +%s) - ${t0:-$(date +%s)}) / 60 ))m (background, shares bandwidth)"
+}
+oa_layers_done() {   # finished LAYER ids only (docker also reports config/index blobs -- not in the map)
+  sed -n 's/^\([0-9a-f]\{12\}\): \(Download complete\|Pull complete\|Already exists\)$/\1/p' /tmp/ws-oa-pull.log 2>/dev/null | sort -u \
+    | grep -xFf <(cut -f1 /tmp/ws-oa-pull.log.map 2>/dev/null) 2>/dev/null
+}
+oa_watch_step() {   # print "OA done c/n id (size)" for each layer newly finished; state in OA_SEEN
+  local M=/tmp/ws-oa-pull.log.map id sz n
+  [ -s "$M" ] || return 0; n="$(grep -c . "$M")"
+  for id in $(oa_layers_done); do
+    case " $OA_SEEN " in *" $id "*) continue;; esac
+    OA_SEEN="$OA_SEEN $id"; OA_C=$((OA_C+1)); sz="$(awk -F'\t' -v i="$id" '$1==i {printf "%.0f MB", $2/1048576}' "$M")"
+    echo "OA done $OA_C/$n $id (${sz:-? MB})"
+  done
 }
 lfs_watch() {    # dir map n: "LFS done 12/78 archive/x.tar.gz.03 (126 MB)" per finished file, status every 10s
-  local t0="${LFS_T0:-$(date +%s)}" i=0 done c=0 oid name size
+  local t0="${LFS_T0:-$(date +%s)}" i=0 done c=0 oid name size; OA_SEEN=; OA_C=0
   done="$(lfs_have "$1")"; c="$(lfs_have "$1" | grep -cFf - <(cut -f1 "$2"))"
   while sleep 2; do
     while IFS=$'\t' read -r oid name size; do
@@ -264,6 +291,7 @@ lfs_watch() {    # dir map n: "LFS done 12/78 archive/x.tar.gz.03 (126 MB)" per 
       [ -s "$1/.git/lfs/objects/${oid:0:2}/${oid:2:2}/$oid" ] || continue
       done="$done $oid"; c=$((c+1)); echo "LFS done $c/$3 $name ($size)"
     done <"$2"
+    oa_watch_step
     i=$((i+1)); [ $((i % 5)) = 0 ] && lfs_status "$1" "$2" "$3" "$t0"
     [ $((i % 15)) = 0 ] && oa_pull_status
   done
@@ -286,8 +314,8 @@ clone_do() {
   if [ "$ws_state" = empty ]; then rmdir "$WS_DIR" || return 1; fi
   (cd "$(dirname "$WS_DIR")" && GIT_TERMINAL_PROMPT=0 GIT_LFS_SKIP_SMUDGE=1 git clone --progress "$WS_URL" "$(basename "$WS_DIR")") || return 1
   # Q.5: the public OA base (4.2 GB from mcr) downloads CONCURRENT with the LFS fetch; install.sh stage 9 awaits it
-  [ "${INIT_SKIP_LFS:-0}" = 1 ] || { (cd "$WS_DIR" && ./install.sh --pull-base) >/dev/null 2>&1
-    echo "NOTE: OA base image (~4.2 GB, docker pull from mcr) downloads in the background and SHARES bandwidth with LFS; log /tmp/ws-oa-pull.log"; }
+  # install.sh checks first: a base already present with the pinned layers is NOT pulled again
+  [ "${INIT_SKIP_LFS:-0}" = 1 ] || (cd "$WS_DIR" && ./install.sh --pull-base) 2>/dev/null | grep '^OA base pull:' 
   sub_lfs_do
 }
 sub_missing() { [ "${INIT_SKIP_SUBMODULES:-0}" != 1 ] && git -C "$WS_DIR" submodule status $(sub_paths) 2>/dev/null | grep -q '^-'; }
