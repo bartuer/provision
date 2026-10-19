@@ -254,8 +254,32 @@ lfs_do() {   # foreground, so its meter owns the tty: "Downloading LFS objects: 
   tot="$(awk -F'\t' '{split($3,a," "); m=(a[2]=="GB")?1024:(a[2]=="KB")?1/1024:(a[2]=="B")?1/1048576:1; t+=a[1]*m} END {printf "%.1f GB", t/1024}' "$map")"
   echo "LFS: $n objects, $tot, $LFS_JOBS downloads in parallel (git's meter: /tmp/ws-lfs.err)"
   export LFS_T0 LFS_G0; LFS_T0="$(date +%s)"; LFS_G0="$(du -sb "$WS_DIR/.git/lfs/objects" 2>/dev/null | cut -f1)"
+  : >/tmp/ws-lfs.err
   lfs_watch "$WS_DIR" "$map" "$n" & local w=$!
-  git -C "$WS_DIR" lfs pull 2>/tmp/ws-lfs.err; local rc=$?
+  # STALL guard (measured 2026-10-19: a devbox sat at 91/115 for 30+ min while c17 pulls all 115 in 119s):
+  # when the object store + in-flight bytes do not grow for LFS_STALL s, kill the pull and start it again --
+  # finished objects are kept, so a retry fetches only the rest.  Up to LFS_TRIES pulls.
+  local rc=1 try=1 tries="${LFS_TRIES:-4}" stall="${LFS_STALL:-120}"
+  while :; do
+    git -C "$WS_DIR" lfs pull 2>>/tmp/ws-lfs.err & local p=$!
+    local last=-1 still=0 now
+    while kill -0 "$p" 2>/dev/null; do
+      sleep 5
+      now="$(du -sb "$WS_DIR/.git/lfs/objects" "$WS_DIR/.git/lfs/incomplete" 2>/dev/null | awk '{t+=$1} END {print t+0}')"
+      if [ "$now" = "$last" ]; then still=$((still+5)); else still=0; last="$now"; fi
+      if [ "$still" -ge "$stall" ]; then
+        if [ "$try" -lt "$tries" ]; then echo "LFS: STALLED -- no bytes for ${stall}s; restarting git lfs pull (try $((try+1))/$tries, done files are kept)"
+        else echo "LFS: STALLED -- no bytes for ${stall}s; giving up after $tries tries (re-run to resume)"; fi
+        pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; break
+      fi
+    done
+    wait "$p"; rc=$?
+    [ "$still" -ge "$stall" ] && rc=124
+    [ $rc = 0 ] && break
+    try=$((try+1)); [ $try -gt "$tries" ] && break
+    [ $rc != 124 ] && echo "LFS: git lfs pull rc=$rc; retry $try/$tries"
+    sleep 3
+  done
   kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
   lfs_status "$WS_DIR" "$map" "$n" "$LFS_T0" final
   oa_pull_status
