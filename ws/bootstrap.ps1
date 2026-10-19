@@ -10,9 +10,8 @@
       ADMIN   elevated?  (a real run needs it for WSL / DISTRO installs)
       WSL     Ubuntu-26.04 on WSL2: absent -> `wsl --install -d Ubuntu-26.04 --no-launch` (engine + distro in one
               step, live progress; no reboot)
-      GIT     git.exe; absent -> `winget install -e --id Git.Git`
-      GCM     `git credential-manager --version`; absent -> comes with Git, else
-              `winget install -e --id Microsoft.GitCredentialManagerCore`
+      GIT     git.exe; absent -> Git for Windows from its GitHub release (winget only as fallback)
+      GCM     `git credential-manager --version`; absent -> comes with Git, else the GCM GitHub release
       INIT    init.sh (next to this file, else -InitUrl) run as root in the distro: dry-run -> its own dry
               run is shown as `  init: ...` lines; real run -> `init.sh --apply`.  On failure the one-liner to
               re-run is this same bootstrap (everything is idempotent).
@@ -194,49 +193,64 @@ $v = DistroVer
 if ($v -eq "ubuntu $WantVersion") { Emit 'WSL' "ok $($script:D) WSL2 ($v)" }
 else { Emit 'WSL' "FAIL $($script:D) reports '$v', the fleet needs ubuntu $WantVersion (rc=$($script:rc))"; return (Done) }
 
-# GIT -- Git for Windows (brings GCM).  winget is pinned to `--source winget`: a fresh devbox's msstore source
-# fails the search ("Failed when searching source: msstore ... No packages were found").  winget absent or
-# failing -> the installer straight from github.com/git-for-windows releases (BITS download, progress bar).
+# GIT + GCM -- straight from the GitHub releases (Invoke-RestMethod/BITS use the Windows cert store, so a
+# TLS-inspecting corporate proxy is trusted).  winget is only the FALLBACK: on a devbox it fails twice --
+# msstore "No packages were found" and "The server certificate did not match any of the expected values"
+# (winget pins its CDN certificate, the proxy re-signs it).
 function HaveGit { RefreshPath; [bool](Get-Command git.exe -ErrorAction SilentlyContinue) }
-function GitDirect {
-    Step 'GIT: download the Git for Windows installer (github.com/git-for-windows/git, latest release)'
+function HaveGcm { if (-not (HaveGit)) { return $false }; Native 'git.exe' @('credential-manager', '--version') | Out-Null; return ($script:rc -eq 0) }
+function GhInstall([string]$repo, [string]$pattern, [string[]]$args2, [string]$what) {
+    # latest release asset of github.com/$repo matching $pattern -> %TEMP% (BITS progress bar) -> run silent (Live)
+    Step "${what}: latest release of github.com/$repo"
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+    $u = $null; $name = $null
     try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $rel = Invoke-RestMethod -UseBasicParsing 'https://api.github.com/repos/git-for-windows/git/releases/latest'
-        $asset = $rel.assets | Where-Object { $_.name -match '^Git-[\d.]+(\.\d+)?-64-bit\.exe$' } | Select-Object -First 1
-        if (-not $asset) { Write-Host '  git: no 64-bit installer in the latest release'; return }
-        $exe = Join-Path $env:TEMP $asset.name
-        try { Start-BitsTransfer -Source $asset.browser_download_url -Destination $exe -DisplayName "download $($asset.name)" -ErrorAction Stop }
-        catch { Write-Host "  git: BITS failed ($_), plain download"; (New-Object Net.WebClient).DownloadFile($asset.browser_download_url, $exe) }
-    } catch { Write-Host "  git: download failed: $_"; return }
-    Step "GIT: $($asset.name) /SILENT (its own progress window)"
-    Live $exe @('/SILENT', '/NORESTART', '/NOCANCEL', '/SP-', '/SUPPRESSMSGBOXES', '/COMPONENTS=gitlfs') -What "install $($asset.name)" -Timeout 1200
+        $rel = Invoke-RestMethod -UseBasicParsing "https://api.github.com/repos/$repo/releases/latest"
+        $as = $rel.assets | Where-Object { $_.name -match $pattern } | Select-Object -First 1
+        if ($as) { $u = $as.browser_download_url; $name = $as.name }
+    } catch { Write-Host "  ${what}: api.github.com failed ($($_.Exception.Message)); trying the release page" }
+    if (-not $u) {   # api rate limit / blocked: scrape the expanded-assets page of the latest tag
+        try {
+            $r = Invoke-WebRequest -UseBasicParsing "https://github.com/$repo/releases/latest" -MaximumRedirection 5
+            $tag = ($r.BaseResponse.ResponseUri.AbsoluteUri -split '/tag/')[-1]
+            $page = (Invoke-WebRequest -UseBasicParsing "https://github.com/$repo/releases/expanded_assets/$tag").Content
+            $m = [regex]::Matches($page, 'href="(/' + [regex]::Escape($repo) + '/releases/download/[^"]+)"') | ForEach-Object { $_.Groups[1].Value } |
+                 Where-Object { ($_ -split '/')[-1] -match $pattern } | Select-Object -First 1
+            if ($m) { $u = "https://github.com$m"; $name = ($m -split '/')[-1] }
+        } catch { Write-Host "  ${what}: release page failed ($($_.Exception.Message))" }
+    }
+    if (-not $u) { Write-Host "  ${what}: no installer matching $pattern found"; $script:rc = 2; return }
+    $exe = Join-Path $env:TEMP $name
+    Step "${what}: download $name"
+    try { Start-BitsTransfer -Source $u -Destination $exe -DisplayName "download $name" -ErrorAction Stop }
+    catch { Write-Host "  ${what}: BITS failed ($($_.Exception.Message)), plain download"
+            try { $ProgressPreference = 'Continue'; Invoke-WebRequest -UseBasicParsing $u -OutFile $exe } catch { Write-Host "  ${what}: download failed: $($_.Exception.Message)"; $script:rc = 3; return } }
+    Step "${what}: $name (silent install)"
+    Live $exe $args2 -What "install $name" -Timeout 1200
     Remove-Item $exe -ErrorAction SilentlyContinue
 }
-if (HaveGit) { Emit 'GIT' 'ok' }
-elseif (-not $Apply) { Emit 'GIT' 'WOULD winget install -e --id Git.Git --source winget, else the github.com/git-for-windows installer' }
-else {
-    $how = ''
-    if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
-        Step 'GIT: winget install Git.Git --source winget (timeout 15 min)'
-        Live 'winget.exe' -a @('install', '-e', '--id', 'Git.Git', '--source', 'winget', '--silent', '--accept-package-agreements', '--accept-source-agreements') -Timeout 900
-        if (HaveGit) { $how = 'winget install Git.Git' }
-    }
-    if (-not $how) { GitDirect; if (HaveGit) { $how = 'Git for Windows installer (github release)' } }
-    if ($how) { Emit 'GIT' "did $how" } else { Emit 'GIT' "FAIL git.exe still absent after winget and the direct installer (rc=$($script:rc)) -- log: $LogFile" }
+function WingetInstall([string]$id, [string]$what) {
+    if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) { return }
+    Step "${what}: fallback winget install $id --source winget"
+    Live 'winget.exe' -a @('install', '-e', '--id', $id, '--source', 'winget', '--silent', '--accept-package-agreements', '--accept-source-agreements') -Timeout 900
 }
-
-# GCM
-$gcmOk = $false
-$gitOk = [bool](Get-Command git.exe -ErrorAction SilentlyContinue)
-if ($gitOk) { Native 'git.exe' @('credential-manager', '--version') | Out-Null; $gcmOk = ($script:rc -eq 0) }
-if ($gcmOk) { Emit 'GCM' 'ok' }
-elseif (-not $gitOk -and $Apply) { Emit 'GCM' 'FAIL needs git.exe (see GIT)' }
-elseif (-not $Apply) { Emit 'GCM' 'WOULD (ships with Git for Windows) else winget install -e --id Microsoft.GitCredentialManagerCore' }
-else { Step 'GCM: winget install Microsoft.GitCredentialManagerCore (timeout 30 min)'
-       Live 'winget.exe' -a @('install', '-e', '--id', 'Microsoft.GitCredentialManagerCore', '--source', 'winget', '--silent', '--accept-package-agreements', '--accept-source-agreements')
-       RefreshPath; Native 'git.exe' @('credential-manager', '--version') | Out-Null
-       if ($script:rc -eq 0) { Emit 'GCM' 'did winget install GitCredentialManagerCore' } else { Emit 'GCM' 'FAIL git credential-manager still absent' } }
+$inno = @('/VERYSILENT', '/NORESTART', '/NOCANCEL', '/SP-', '/SUPPRESSMSGBOXES')
+if (HaveGit) { Emit 'GIT' 'ok' }
+elseif (-not $Apply) { Emit 'GIT' 'WOULD install Git for Windows from github.com/git-for-windows/git (winget fallback)' }
+else {
+    GhInstall 'git-for-windows/git' '^Git-[\d.]+-64-bit\.exe$' $inno 'GIT'
+    if (-not (HaveGit)) { WingetInstall 'Git.Git' 'GIT' }
+    if (HaveGit) { Emit 'GIT' "did install Git for Windows ($((& git.exe --version) -join ''))" }
+    else { Emit 'GIT' "FAIL git.exe still absent (github download and winget both failed, rc=$($script:rc)) -- log: $LogFile" }
+}
+if (HaveGcm) { Emit 'GCM' 'ok' }
+elseif (-not $Apply) { Emit 'GCM' 'WOULD install Git Credential Manager from github.com/git-ecosystem/git-credential-manager' }
+elseif (-not (HaveGit)) { Emit 'GCM' 'FAIL needs git.exe (see GIT)' }
+else {
+    GhInstall 'git-ecosystem/git-credential-manager' '^gcm-win-x64-[\d.]+\.exe$' $inno 'GCM'
+    if (-not (HaveGcm)) { WingetInstall 'Git.GCM' 'GCM' }
+    if (HaveGcm) { Emit 'GCM' 'did install Git Credential Manager' } else { Emit 'GCM' "FAIL git credential-manager still absent (rc=$($script:rc)) -- log: $LogFile" }
+}
 
 # INIT
 $here = $(if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { '' })
