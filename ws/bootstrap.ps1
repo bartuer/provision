@@ -199,16 +199,18 @@ else { Emit 'WSL' "FAIL $($script:D) reports '$v', the fleet needs ubuntu $WantV
 # (winget pins its CDN certificate, the proxy re-signs it).
 function HaveGit { RefreshPath; [bool](Get-Command git.exe -ErrorAction SilentlyContinue) }
 function HaveGcm { if (-not (HaveGit)) { return $false }; Native 'git.exe' @('credential-manager', '--version') | Out-Null; return ($script:rc -eq 0) }
-function GhInstall([string]$repo, [string]$pattern, [string[]]$args2, [string]$what) {
-    # latest release asset of github.com/$repo matching $pattern -> %TEMP% (BITS progress bar) -> run silent (Live)
-    Step "${what}: latest release of github.com/$repo"
+function GhInstall([string]$repo, [string]$pattern, [string[]]$args2, [string]$what, [string]$pin = '') {
+    # $pin (a fixed release asset URL, the version proven on c17) first; else the latest release asset of
+    # github.com/$repo matching $pattern -> %TEMP% (BITS progress bar) -> run silent (Live)
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
     $u = $null; $name = $null
-    try {
+    if ($pin) { $u = $pin; $name = ($pin -split '/')[-1]; Step "${what}: pinned $name" }
+    else { Step "${what}: latest release of github.com/$repo" }
+    if (-not $u) { try {
         $rel = Invoke-RestMethod -UseBasicParsing "https://api.github.com/repos/$repo/releases/latest"
         $as = $rel.assets | Where-Object { $_.name -match $pattern } | Select-Object -First 1
         if ($as) { $u = $as.browser_download_url; $name = $as.name }
-    } catch { Write-Host "  ${what}: api.github.com failed ($($_.Exception.Message)); trying the release page" }
+    } catch { Write-Host "  ${what}: api.github.com failed ($($_.Exception.Message)); trying the release page" } }
     if (-not $u) {   # api rate limit / blocked: scrape the expanded-assets page of the latest tag
         try {
             $r = Invoke-WebRequest -UseBasicParsing "https://github.com/$repo/releases/latest" -MaximumRedirection 5
@@ -234,22 +236,52 @@ function WingetInstall([string]$id, [string]$what) {
     Step "${what}: fallback winget install $id --source winget"
     Live 'winget.exe' -a @('install', '-e', '--id', $id, '--source', 'winget', '--silent', '--accept-package-agreements', '--accept-source-agreements') -Timeout 900
 }
+# Pinned to what works on c17 (Git for Windows 2.55.0.5 bundles GCM 2.9.1): same build on every devbox, fixed
+# GCM path C:\Program Files\Git\mingw64\bin\git-credential-manager.exe.  Latest release / winget only as fallbacks.
+$GitPin = 'https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/Git-2.55.0.5-64-bit.exe'
+$GitDir = "$env:ProgramFiles\Git"
 $inno = @('/VERYSILENT', '/NORESTART', '/NOCANCEL', '/SP-', '/SUPPRESSMSGBOXES')
 if (HaveGit) { Emit 'GIT' 'ok' }
-elseif (-not $Apply) { Emit 'GIT' 'WOULD install Git for Windows from github.com/git-for-windows/git (winget fallback)' }
+elseif (-not $Apply) { Emit 'GIT' 'WOULD install Git for Windows 2.55.0.5 (pinned; bundles GCM) into $GitDir' }
 else {
-    GhInstall 'git-for-windows/git' '^Git-[\d.]+-64-bit\.exe$' $inno 'GIT'
+    GhInstall 'git-for-windows/git' '' ($inno + @("/DIR=$GitDir")) 'GIT' $GitPin   # pinned: brings GCM at $GitDir\mingw64\bin
+    if (-not (HaveGit)) { GhInstall 'git-for-windows/git' '^Git-[\d.]+-64-bit\.exe$' ($inno + @("/DIR=$GitDir")) 'GIT' }
     if (-not (HaveGit)) { WingetInstall 'Git.Git' 'GIT' }
     if (HaveGit) { Emit 'GIT' "did install Git for Windows ($((& git.exe --version) -join ''))" }
     else { Emit 'GIT' "FAIL git.exe still absent (github download and winget both failed, rc=$($script:rc)) -- log: $LogFile" }
 }
-if (HaveGcm) { Emit 'GCM' 'ok' }
+function GcmExe {   # the Windows git-credential-manager.exe (WINDOWS path; init.sh converts it with wslpath)
+    RefreshPath
+    $c = New-Object System.Collections.Generic.List[string]
+    $g = (Get-Command git.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    if ($g) {
+        try { $ep = (& $g --exec-path 2>$null | Select-Object -First 1) -replace '/', '\' } catch { $ep = '' }   # ...\mingw64\libexec\git-core
+        if ($ep) { $c.Add("$ep\git-credential-manager.exe"); $c.Add((Join-Path (Split-Path (Split-Path $ep -Parent) -Parent) 'bin\git-credential-manager.exe')) }
+        $root = Split-Path (Split-Path $g -Parent) -Parent   # ...\Git\cmd\git.exe -> ...\Git
+        $c.Add("$root\mingw64\bin\git-credential-manager.exe"); $c.Add("$root\mingw64\libexec\git-core\git-credential-manager.exe")
+    }
+    $w = (Get-Command git-credential-manager.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source; if ($w) { $c.Add($w) }
+    foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, "$env:LOCALAPPDATA\Programs", "$env:LOCALAPPDATA")) {
+        if ($pf) { $c.Add("$pf\Git Credential Manager\git-credential-manager.exe"); $c.Add("$pf\Git\mingw64\bin\git-credential-manager.exe") } }
+    $hit = $c | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+    if (-not $hit) {   # last resort: search the git root, then the usual roots
+        foreach ($r in @($(if ($g) { Split-Path (Split-Path $g -Parent) -Parent }), $env:ProgramFiles, ${env:ProgramFiles(x86)}, "$env:LOCALAPPDATA\Programs")) {
+            if (-not $r -or -not (Test-Path $r)) { continue }
+            $hit = Get-ChildItem -Path $r -Filter 'git-credential-manager*.exe' -Recurse -Depth 5 -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+            if ($hit) { break }
+        }
+    }
+    if (-not $hit) { Write-Host "  gcm: NOT FOUND (git.exe=$g; tried: $($c -join ' | '))"; return '' }
+    return $hit
+}
+if (HaveGcm) { Emit 'GCM' "ok $(GcmExe) (git.exe credential-manager works)" }
 elseif (-not $Apply) { Emit 'GCM' 'WOULD install Git Credential Manager from github.com/git-ecosystem/git-credential-manager' }
 elseif (-not (HaveGit)) { Emit 'GCM' 'FAIL needs git.exe (see GIT)' }
 else {
-    GhInstall 'git-ecosystem/git-credential-manager' '^gcm-win-x64-[\d.]+\.exe$' $inno 'GCM'
+    # only reached when the installed git lacks its bundled GCM: standalone, pinned to the 2.x line
+    GhInstall 'git-ecosystem/git-credential-manager' '' $inno 'GCM' 'https://github.com/git-ecosystem/git-credential-manager/releases/download/v2.7.3/gcm-win-x64-2.7.3.exe'
     if (-not (HaveGcm)) { WingetInstall 'Git.GCM' 'GCM' }
-    if (HaveGcm) { Emit 'GCM' 'did install Git Credential Manager' } else { Emit 'GCM' "FAIL git credential-manager still absent (rc=$($script:rc)) -- log: $LogFile" }
+    if (HaveGcm) { Emit 'GCM' "did install Git Credential Manager: $(GcmExe)" } else { Emit 'GCM' "FAIL git credential-manager still absent (rc=$($script:rc)) -- log: $LogFile" }
 }
 
 # INIT
@@ -262,30 +294,21 @@ elseif ($url) { $src = $url; try { $init = (Invoke-RestMethod -UseBasicParsing $
 if (-not $User) { $User = "$env:USERNAME".ToLower() -replace '[^a-z0-9_-]', '' }
 if ($User -notmatch '^[a-z][a-z0-9_-]{0,31}$') { $User = 'dev' }
 $oneLiner = $(if ($url) { "curl -fsSL '$url' | WS_URL='$WsUrl' bash -s -- --apply" } else { "WS_URL='$WsUrl' bash init.sh --apply   # init.sh from the bootstrap gist" })
-function GcmExe {   # the Windows git-credential-manager.exe, as the WSL /mnt/<drive>/... path init.sh hands to git
-    $c = @()
-    $g = (Get-Command git.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
-    if ($g) { $root = Split-Path (Split-Path $g -Parent) -Parent   # ...\Git\cmd\git.exe -> ...\Git
-              $c += "$root\mingw64\bin\git-credential-manager.exe", "$root\mingw64\libexec\git-core\git-credential-manager.exe" }
-    $c += (Get-Command git-credential-manager.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
-    foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, "$env:LOCALAPPDATA\Programs")) {
-        if ($pf) { $c += "$pf\Git Credential Manager\git-credential-manager.exe", "$pf\Git\mingw64\bin\git-credential-manager.exe" } }
-    $hit = $c | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-    if (-not $hit) { return '' }
-    return '/mnt/' + $hit.Substring(0, 1).ToLower() + ($hit.Substring(2) -replace '\\', '/')
-}
-$GcmWsl = GcmExe
-if ($GcmWsl) { Write-Host "  gcm: $GcmWsl" }
+Step 'GCM: locate git-credential-manager.exe for WSL'
+$GcmWin = GcmExe
+$GitWin = (Get-Command git.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+Write-Host "  git.exe : $(if ($GitWin) { $GitWin } else { 'NOT FOUND' })" -ForegroundColor Cyan
+if ($GcmWin) { Write-Host "  gcm     : $GcmWin" -ForegroundColor Green } else { Write-Host "  gcm     : NOT FOUND (see the 'tried' list above)" -ForegroundColor Red }
 function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding mangling), stdin left to the console
     $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($init -replace "`r`n", "`n")))
-    $cmd = "echo $b64 | base64 -d > /tmp/ws-init.sh && INIT_GCM='$GcmWsl' INIT_USER='$User' WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode; rc=`$?; rm -f /tmp/ws-init.sh; exit `$rc"
+    $cmd = "echo $b64 | base64 -d > /tmp/ws-init.sh && INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_USER='$User' WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode; rc=`$?; rm -f /tmp/ws-init.sh; exit `$rc"
     $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     if ($mode -eq '--apply') {   # long (apt, clone + ADO auth, lfs, install.sh): run in its OWN Ubuntu window = a real tty,
         # so apt / git clone / lfs draw their native progress and a credential prompt can be answered there.
         # `script` keeps the pty AND logs to /tmp/ws-init.out; this window shows a progress bar + the last log line.
         $ErrorActionPreference = $old
         $run = "rm -f /tmp/ws-init.out; echo $b64 | base64 -d > /tmp/ws-init.sh; " +
-               "export INIT_GCM='$GcmWsl' INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
+               "export INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
                "else WS_URL='$WsUrl' bash /tmp/ws-init.sh --apply 2>&1 | tee /tmp/ws-init.out; fi; rc=`$?; rm -f /tmp/ws-init.sh; " +
                "if [ `$rc != 0 ]; then echo; echo 'init.sh FAILED (rc='`$rc') -- see the FAIL line above; press Enter to close'; read x; fi; exit `$rc"
         Step "INIT: init.sh --apply as root in a NEW Ubuntu window ($($script:D)) -- type the password for WSL user '$User' there, then watch apt / git clone / sign-in"
@@ -332,6 +355,7 @@ if ($r -eq 'RESTART_NEEDED') {
     RunInit '--apply'
     $r = ($script:initOut | Where-Object { $_ -match '^RESULT=' } | Select-Object -Last 1) -replace '^RESULT=', ''
 }
+Emit 'GCMPATH' "win=$(if ($GcmWin) { $GcmWin } else { 'NOT FOUND' }) git=$GitWin"
 if ($r -eq 'OK') { Emit 'INIT' "ok init.sh --apply in $($script:D)" }
 else {
     $why = @($script:initOut | Where-Object { $_ -match '=FAIL' }) -join '; '

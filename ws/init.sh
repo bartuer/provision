@@ -161,24 +161,35 @@ else
 fi
 
 # GCM
-gcm="${INIT_GCM:-}"
-[ -n "$gcm" ] && [ ! -x "$gcm" ] && gcm=""   # a stale path from the caller: search instead
+gcm="${INIT_GCM:-}"; gcm_why=""
+if [ -z "$gcm" ] && [ -n "${INIT_GCM_WIN:-}" ]; then   # the bootstrap found it on Windows: C:\...\x.exe -> /mnt/c/... (honours wsl.conf automount root)
+  gcm="$(wslpath -u "$INIT_GCM_WIN" 2>/dev/null)"
+  [ -n "$gcm" ] || { d="$(printf '%s' "$INIT_GCM_WIN" | cut -c1 | tr A-Z a-z)"; gcm="$MNT/../$d/$(printf '%s' "$INIT_GCM_WIN" | cut -c4- | tr '\\' /)"; }
+fi
+if [ -n "$gcm" ] && [ ! -f "$gcm" ]; then gcm_why=" (given '${INIT_GCM_WIN:-$gcm}' -> '$gcm': not a file; is $MNT mounted? $(ls -d "$MNT" 2>&1 | head -1))"; gcm=""; fi
+[ -z "${INIT_GCM_WIN:-}${INIT_GCM:-}" ] && gcm_why=" (the bootstrap passed no path)"
 if [ -z "$gcm" ]; then
   for g in "$MNT/Program Files/Git/mingw64/bin/git-credential-manager.exe" \
            "$MNT/Program Files/Git/mingw64/libexec/git-core/git-credential-manager.exe" \
            "$MNT"/Program\ Files*/Git\ Credential\ Manager*/git-credential-manager*.exe \
            "$MNT"/Users/*/AppData/Local/Programs/Git/mingw64/bin/git-credential-manager.exe; do
-    [ -x "$g" ] && { gcm="$g"; break; }
+    [ -f "$g" ] && { gcm="$g"; gcm_why=""; break; }
   done
+fi
+gcm_args=""
+if [ -z "$gcm" ] && [ -n "${INIT_GIT_WIN:-}" ]; then   # fallback: the Windows git.exe runs GCM itself (`git.exe credential-manager get`)
+  gw="$(wslpath -u "$INIT_GIT_WIN" 2>/dev/null)"
+  if [ -n "$gw" ] && [ -f "$gw" ]; then gcm="$gw"; gcm_args=" credential-manager"; gcm_why=""
+  else gcm_why="$gcm_why (git.exe '$INIT_GIT_WIN' -> '$gw': not a file)"; fi
 fi
 if [ -z "$gcm" ]; then
   # ADO refuses a typed password, so a clone without GCM can only fail: stop here, before git prompts for one
-  if [ "$ws_state" != clone ] && [ "$APPLY" = 1 ] && case "$WS_URL" in https://*) true;; *) false;; esac; then bad GCM "no Windows git-credential-manager.exe under $MNT -- the bootstrap installs Git for Windows (it brings GCM); re-run it"; finish; fi
-  say GCM "WARN no Windows git-credential-manager.exe under $MNT"
+  if [ "$ws_state" != clone ] && [ "$APPLY" = 1 ] && case "$WS_URL" in https://*) true;; *) false;; esac; then bad GCM "no Windows git-credential-manager.exe under $MNT$gcm_why -- the bootstrap installs Git for Windows (it brings GCM); re-run it"; finish; fi
+  say GCM "WARN no Windows git-credential-manager.exe under $MNT$gcm_why"
 elif ! command -v git >/dev/null 2>&1; then say GCM "WOULD credential.helper -> $gcm (after APT)"
 else
-  helper="$(printf '%s' "$gcm" | sed 's/ /\\ /g')"
-  if [ "$(git config --system --get credential.helper 2>/dev/null)" = "$helper" ]; then say GCM ok
+  helper="$(printf '%s' "$gcm" | sed 's/ /\\ /g')$gcm_args"
+  if [ "$(git config --system --get credential.helper 2>/dev/null)" = "$helper" ]; then say GCM "ok $helper"
   else
     gcm_do() { git config --system credential.helper "$helper" && git config --system credential.https://dev.azure.com.useHttpPath true; }
     act GCM "git config --system credential.helper $helper" gcm_do
