@@ -332,9 +332,31 @@ clone_do() {
 }
 sub_missing() { [ "${INIT_SKIP_SUBMODULES:-0}" != 1 ] && git -C "$WS_DIR" submodule status $(sub_paths) 2>/dev/null | grep -q '^-'; }
 SUB_WHAT="$([ "${INIT_SUBMODULES:-0}" = 1 ] && echo "git submodule update $SUB_ARGS" || echo "git submodule update $SUB_ARGS ssg_agent")"
+# UPDATE: an existing clone is fast-forwarded to origin first -- otherwise a re-run resumes the LFS objects of an
+# OLD commit (measured 2026-10-19: a devbox clone from before 48b3021 downloaded the retired alserver.tar.gz.XX
+# parts instead of the alserver.NN shards).  Only a clean tree is moved; local commits/edits -> WARN, left alone.
+update_do() {
+  GIT_TERMINAL_PROMPT=0 git -C "$WS_DIR" fetch --quiet origin || { echo "UPDATE: git fetch failed"; return 1; }
+  local up; up="$(git -C "$WS_DIR" rev-parse --abbrev-ref '@{u}' 2>/dev/null)" || { echo "UPDATE: no upstream branch -- left alone"; return 0; }
+  local h u; h="$(git -C "$WS_DIR" rev-parse HEAD)"; u="$(git -C "$WS_DIR" rev-parse "$up")"
+  [ "$h" = "$u" ] && { echo "UPDATE: at $up ${h:0:7}"; return 0; }
+  if [ -n "$(git -C "$WS_DIR" status --porcelain --untracked-files=no)" ]; then
+    echo "UPDATE: WARN local edits -- not moving ${h:0:7} to $up ${u:0:7}"; return 0; fi
+  GIT_LFS_SKIP_SMUDGE=1 git -C "$WS_DIR" merge --ff-only --quiet "$up" \
+    || { echo "UPDATE: WARN ${h:0:7} cannot fast-forward to $up ${u:0:7} -- left alone"; return 0; }
+  echo "UPDATE: ${h:0:7} -> ${u:0:7} ($up)"
+}
+behind() {   # the clone is clean and origin has commits it lacks (fetch first; dry-run only reads)
+  [ "$APPLY" = 1 ] && GIT_TERMINAL_PROMPT=0 git -C "$WS_DIR" fetch --quiet origin 2>/dev/null
+  local up; up="$(git -C "$WS_DIR" rev-parse --abbrev-ref '@{u}' 2>/dev/null)" || return 1
+  [ "$(git -C "$WS_DIR" rev-parse HEAD)" != "$(git -C "$WS_DIR" rev-parse "$up")" ]
+}
 if [ "$ws_state" = clone ]; then
-  if sub_missing; then resume_do() { sub_lfs_do; }
-  act CLONE "$SUB_WHAT (resume) + git lfs pull" resume_do || finish
+  if behind; then
+    resume_do() { update_do || return 1; if sub_missing; then sub_lfs_do; else lfs_do; fi; }
+    act CLONE "git fast-forward to origin + $(sub_missing && echo "$SUB_WHAT (resume) + ")git lfs pull" resume_do || finish
+  elif sub_missing; then resume_do() { sub_lfs_do; }
+    act CLONE "$SUB_WHAT (resume) + git lfs pull" resume_do || finish
   else say CLONE ok; fi
 else act CLONE "cd $(dirname "$WS_DIR") && git clone $WS_URL + $SUB_WHAT + git lfs pull (lfs.concurrenttransfers=$LFS_JOBS, ssg_agent in parallel)" clone_do || finish; fi
 
