@@ -283,6 +283,8 @@ lfs_do() {   # foreground, so its meter owns the tty: "Downloading LFS objects: 
   kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
   lfs_status "$WS_DIR" "$map" "$n" "$LFS_T0" final
   oa_pull_status
+  if [ $rc = 0 ]; then local m; m="$(lfs_missing | wc -l)"
+    [ "$m" = 0 ] || { echo "LFS: git lfs pull rc=0 but $m files are still pointers: $(lfs_missing | head -3 | tr '\n' ' ')"; rc=1; }; fi
   [ $rc = 0 ] || { echo "LFS: git lfs pull FAILED (rc=$rc):"; tr '\r' '\n' </tmp/ws-lfs.err | tail -20; }
   return $rc
 }
@@ -370,6 +372,10 @@ update_do() {
     || { echo "UPDATE: WARN ${h:0:7} cannot fast-forward to $up ${u:0:7} -- left alone"; return 0; }
   echo "UPDATE: ${h:0:7} -> ${u:0:7} ($up)"
 }
+lfs_missing() {   # LFS files whose content is not in the working tree yet ("-" = pointer only)
+  [ "${INIT_SKIP_LFS:-0}" = 1 ] && return 0
+  git -C "$WS_DIR" lfs ls-files 2>/dev/null | awk '$2 == "-" {print $3}'
+}
 behind() {   # the clone is clean and origin has commits it lacks (fetch first; dry-run only reads)
   [ "$APPLY" = 1 ] && GIT_TERMINAL_PROMPT=0 git -C "$WS_DIR" fetch --quiet origin 2>/dev/null
   local up; up="$(git -C "$WS_DIR" rev-parse --abbrev-ref '@{u}' 2>/dev/null)" || return 1
@@ -381,6 +387,8 @@ if [ "$ws_state" = clone ]; then
     act CLONE "git fast-forward to origin + $(sub_missing && echo "$SUB_WHAT (resume) + ")git lfs pull" resume_do || finish
   elif sub_missing; then resume_do() { sub_lfs_do; }
     act CLONE "$SUB_WHAT (resume) + git lfs pull" resume_do || finish
+  elif [ -n "$(lfs_missing)" ]; then   # measured 2026-10-19: an interrupted pull (91/115) re-ran as CLONE=ok
+    act CLONE "git lfs pull (resume: $(lfs_missing | wc -l) LFS files not downloaded yet)" lfs_do || finish
   else say CLONE ok; fi
 else act CLONE "cd $(dirname "$WS_DIR") && git clone $WS_URL + $SUB_WHAT + git lfs pull (lfs.concurrenttransfers=$LFS_JOBS, ssg_agent in parallel)" clone_do || finish; fi
 

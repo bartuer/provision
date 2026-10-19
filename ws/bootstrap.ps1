@@ -336,31 +336,49 @@ Write-Host "  node.exe: $(if ($NodeWin) { "$NodeWin ($((& $NodeWin --version 2>$
 if ($GcmWin) { Write-Host "  gcm     : $GcmWin" -ForegroundColor Green } else { Write-Host "  gcm     : NOT FOUND (see the 'tried' list above)" -ForegroundColor Red }
 function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding mangling), stdin left to the console
     $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($init -replace "`r`n", "`n")))
-    $cmd = "echo $b64 | base64 -d > /tmp/ws-init.sh && INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_USER='$User' WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode; rc=`$?; rm -f /tmp/ws-init.sh; exit `$rc"
+    # init.sh goes over STDIN: its base64 (~33 KB) on the command line exceeds the 32767-char Windows limit
+    # ("The filename or extension is too long" -- init.sh then never starts).  Only short commands go on argv.
+    $null = ($b64 | & wsl.exe -d $script:D -u root -e sh -c "tr -d '\r\n' | base64 -d > /tmp/ws-init.sh" 2>&1)
+    $cmd = "INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_USER='$User' WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode; rc=`$?; rm -f /tmp/ws-init.sh; exit `$rc"
     $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     if ($mode -eq '--apply') {   # long (apt, clone + ADO auth, lfs, install.sh): run in its OWN Ubuntu window = a real tty,
         # so apt / git clone / lfs draw their native progress and a credential prompt can be answered there.
         # `script` keeps the pty AND logs to /tmp/ws-init.out; this window shows a progress bar + the last log line.
         $ErrorActionPreference = $old
-        $run = "rm -f /tmp/ws-init.out; echo $b64 | base64 -d > /tmp/ws-init.sh; " +
+        $run = "rm -f /tmp/ws-init.out; " +
                "export INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
-               "else WS_URL='$WsUrl' bash /tmp/ws-init.sh --apply 2>&1 | tee /tmp/ws-init.out; fi; rc=`$?; rm -f /tmp/ws-init.sh; " +
+               "else WS_URL='$WsUrl' bash /tmp/ws-init.sh --apply 2>&1 | tee /tmp/ws-init.out; fi; rc=`$?; rm -f /tmp/ws-init.sh; echo `$rc > /tmp/ws-init.rc; " +
                "if [ `$rc != 0 ]; then echo; echo 'init.sh FAILED (rc='`$rc') -- see the FAIL line above; press Enter to close'; read x; fi; exit `$rc"
         Step "INIT: init.sh --apply as root in a NEW Ubuntu window ($($script:D)) -- type the password for WSL user '$User' there, then watch apt / git clone / sign-in"
         $path = (Get-Command wsl.exe).Source
-        $p = Start-Process -FilePath $path -ArgumentList ((@('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', $run) | ForEach-Object { Q $_ }) -join ' ') -PassThru
-        $null = $p.Handle
+        # Windows Terminal when present (readable font, resizable, Ctrl+= zooms); else the classic console window.
+        # The command goes to a file first: wt treats ';' as its own separator, so it must not see $run.
+        $rb64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($run))
+        $null = ($rb64 | & wsl.exe -d $script:D -u root -e sh -c "rm -f /tmp/ws-init.rc; tr -d '\r\n' | base64 -d > /tmp/ws-run.sh" 2>&1)
+        $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
+        if ($wt -and $env:WS_NO_WT -ne '1') {
+            Start-Process -FilePath $wt.Source -ArgumentList ((@('-w', 'new', 'new-tab', '--title', 'workspace init', $path, '-d', $script:D, '-u', 'root', '-e', 'bash', '/tmp/ws-run.sh') | ForEach-Object { Q $_ }) -join ' ')
+            $p = $null
+        } else {
+            $p = Start-Process -FilePath $path -ArgumentList ((@('-d', $script:D, '-u', 'root', '-e', 'bash', '/tmp/ws-run.sh') | ForEach-Object { Q $_ }) -join ' ') -PassThru
+            $null = $p.Handle
+        }
+        # done = the rc file exists (wt.exe hands off to the terminal and exits at once, so its process says nothing)
+        $doneF = { [bool](& wsl.exe -d $script:D -u root -e sh -c "test -s /tmp/ws-init.rc && echo y" 2>$null) }
         $sw = [Diagnostics.Stopwatch]::StartNew(); $tail = ''
-        while (-not $p.WaitForExit(5000)) {
+        while (-not (& $doneF)) {
+            if ($p -and $p.HasExited -and -not (& $doneF)) { break }   # console window closed before init.sh finished
+            Start-Sleep -Seconds 5
             $t = [int]$sw.Elapsed.TotalSeconds
             $tl = & wsl.exe -d $script:D -u root -e sh -c "tail -c 4000 /tmp/ws-init.out 2>/dev/null | tr '\r' '\n' | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | grep -v '^[[:space:]]*$' | tail -n 1" 2>$null
             if ($tl) { $tail = ("$tl" -replace "`0", '').Trim() }
             if ($tail.Length -gt 100) { $tail = $tail.Substring(0, 100) }
             Write-Progress -Activity 'init.sh --apply (in the Ubuntu window)' -Status ("{0}m{1:d2}s  {2}" -f [int][math]::Floor($t / 60), ($t % 60), $tail) -PercentComplete -1
-            if ($t -gt 7200) { try { $p.Kill() } catch {}; Write-Host '  init: TIMEOUT after 2h -- killed'; break }
+            if ($t -gt 7200) { if ($p) { try { $p.Kill() } catch {} }; Write-Host '  init: TIMEOUT after 2h -- stopped watching'; break }
         }
-        $p.WaitForExit(); Write-Progress -Activity 'init.sh --apply (in the Ubuntu window)' -Completed
-        $script:rc = $p.ExitCode
+        Write-Progress -Activity 'init.sh --apply (in the Ubuntu window)' -Completed
+        $rcs = & wsl.exe -d $script:D -u root -e sh -c "cat /tmp/ws-init.rc 2>/dev/null" 2>$null
+        $script:rc = if ("$rcs".Trim() -match '^\d+$') { [int]"$rcs".Trim() } else { 1 }
         $script:initOut = @(& wsl.exe -d $script:D -u root -e sh -c "tr '\r' '\n' < /tmp/ws-init.out 2>/dev/null | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | grep -E '^[A-Z_]+='" 2>$null | ForEach-Object { ("$_" -replace "`0", '').Trim() } | Where-Object { $_ })
         foreach ($l in $script:initOut) { Write-Host "  init: $l" }
         Write-Host ("  init: rc={0} in {1}s  (full log in the distro: /tmp/ws-init.out)" -f $script:rc, [int]$sw.Elapsed.TotalSeconds)
