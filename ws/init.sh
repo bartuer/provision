@@ -173,7 +173,7 @@ if [ -z "$gcm" ]; then
 fi
 if [ -z "$gcm" ]; then
   # ADO refuses a typed password, so a clone without GCM can only fail: stop here, before git prompts for one
-  if [ "$ws_state" != clone ] && [ "$APPLY" = 1 ]; then bad GCM "no Windows git-credential-manager.exe under $MNT -- the bootstrap installs Git for Windows (it brings GCM); re-run it"; finish; fi
+  if [ "$ws_state" != clone ] && [ "$APPLY" = 1 ] && case "$WS_URL" in https://*) true;; *) false;; esac; then bad GCM "no Windows git-credential-manager.exe under $MNT -- the bootstrap installs Git for Windows (it brings GCM); re-run it"; finish; fi
   say GCM "WARN no Windows git-credential-manager.exe under $MNT"
 elif ! command -v git >/dev/null 2>&1; then say GCM "WOULD credential.helper -> $gcm (after APT)"
 else
