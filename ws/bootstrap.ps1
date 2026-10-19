@@ -146,7 +146,7 @@ function Distros {   # @{name=..; ver=..; default=$bool} from `wsl -l -v`
     $r = @()
     foreach ($l in (Native 'wsl.exe' @('-l','-v') -Timeout 20 -Tag 'wsl -l -v')) {   # answers in <2s; a hang = the WSL service is stuck, not slow
         if ($l -match '^\s*(\*)?\s*(\S+)\s+(Running|Stopped|Installing|Converting|Uninstalling)\s+(\d)\s*$') {
-            $r += [pscustomobject]@{ name = $Matches[2]; ver = [int]$Matches[4]; default = [bool]$Matches[1] }
+            $r += [pscustomobject]@{ name = $Matches[2]; state = $Matches[3]; ver = [int]$Matches[4]; default = [bool]$Matches[1] }
         }
     }
     return $r
@@ -354,12 +354,12 @@ function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding man
                "if [ `$rc != 0 ]; then echo; echo 'init.sh FAILED (rc='`$rc') -- see the FAIL line above; press Enter to close'; read x; fi; exit `$rc"
         Step "INIT: init.sh --apply as root in a NEW Ubuntu window ($($script:D)) -- type the password for WSL user '$User' there, then watch apt / git clone / sign-in"
         $path = (Get-Command wsl.exe).Source
-        # Windows Terminal when present (readable font, resizable, Ctrl+= zooms); else the classic console window.
+        # The classic wsl.exe console window (user ruling 2026-10-19).  $env:WS_WT=1 opts into Windows Terminal.
         # The command goes to a file first: wt treats ';' as its own separator, so it must not see $run.
         $rb64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($run))
         $null = ($rb64 | & wsl.exe -d $script:D -u root -e sh -c "rm -f /tmp/ws-init.rc; tr -d '\r\n' | base64 -d > /tmp/ws-run.sh" 2>&1)
         $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
-        if ($wt -and $env:WS_NO_WT -ne '1') {
+        if ($wt -and $env:WS_WT -eq '1') {
             Start-Process -FilePath $wt.Source -ArgumentList ((@('-w', 'new', 'new-tab', '--title', 'workspace init', $path, '-d', $script:D, '-u', 'root', '-e', 'bash', '/tmp/ws-run.sh') | ForEach-Object { Q $_ }) -join ' ')
             $p = $null
         } else {
@@ -392,13 +392,66 @@ function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding man
     $ErrorActionPreference = $old
 }
 if (-not $init) { Emit 'INIT' "FAIL could not download init.sh from $url -- check the network, then run this bootstrap again"; return (Done) }
+# WSLNET -- a fresh devbox runs WSL in NAT mode; behind Global Secure Access / a VPN the distro then cannot
+# resolve ANY name (apt: "Temporary failure resolving"), not even via the host's DNS IPs or 1.1.1.1.
+# The fleet's working setting is mirrored networking + DNS tunneling in %USERPROFILE%\.wslconfig.  It takes
+# effect only after the WSL VM restarts (`wsl --shutdown`), so that runs ONLY when DNS is broken, the keys
+# actually changed, and no distro has containers/tmux running.  Never touched when DNS already works.
+function DnsOk { $o = InDistro 'timeout 6 getent ahosts archive.ubuntu.com >/dev/null 2>&1 && echo DNSOK'; return [bool]($o -match 'DNSOK') }
+function WslCfgSet([hashtable]$want) {   # returns $true if .wslconfig changed; keeps every other line
+    $f = Join-Path $env:USERPROFILE '.wslconfig'
+    $lines = @(); if (Test-Path $f) { $lines = @(Get-Content $f) }
+    $out = New-Object System.Collections.Generic.List[string]; $sec = ''; $seen = @{}; $inW = $false; $changed = $false
+    foreach ($l in $lines) {
+        if ($l -match '^\s*\[(.+)\]\s*$') {
+            if ($inW) { foreach ($k in $want.Keys) { if (-not $seen[$k]) { $out.Add("$k=$($want[$k])"); $seen[$k] = 1; $changed = $true } } }
+            $sec = $Matches[1].Trim().ToLower(); $inW = ($sec -eq 'wsl2'); $out.Add($l); continue
+        }
+        if ($inW -and $l -match '^\s*([A-Za-z]+)\s*=\s*(.*?)\s*$' -and $want.ContainsKey($Matches[1])) {
+            $k = $Matches[1]; $seen[$k] = 1
+            if ($Matches[2] -ne $want[$k]) { $out.Add("$k=$($want[$k])"); $changed = $true } else { $out.Add($l) }
+            continue
+        }
+        $out.Add($l)
+    }
+    if ($inW) { foreach ($k in $want.Keys) { if (-not $seen[$k]) { $out.Add("$k=$($want[$k])"); $seen[$k] = 1; $changed = $true } } }
+    if (-not ($lines | Where-Object { $_ -match '^\s*\[wsl2\]\s*$' })) {
+        $out.Insert(0, '[wsl2]'); $i = 1; foreach ($k in $want.Keys) { $out.Insert($i, "$k=$($want[$k])"); $i++ }; $changed = $true
+    }
+    if ($changed) {
+        if (Test-Path $f) { Copy-Item $f "$f.ws-bak" -Force }
+        [IO.File]::WriteAllLines($f, $out.ToArray())   # no BOM: WSL ignores a .wslconfig that starts with one
+    }
+    return $changed
+}
+function FixWslNet {
+    if (DnsOk) { Emit 'WSLNET' 'ok (distro resolves archive.ubuntu.com)'; $script:netOk = $true; return }
+    $want = @{ networkingMode = 'mirrored'; dnsTunneling = 'true' }
+    if (-not $Apply) { Emit 'WSLNET' "WOULD set $env:USERPROFILE\.wslconfig [wsl2] networkingMode=mirrored dnsTunneling=true + wsl --shutdown (the distro cannot resolve names)"; $script:netOk = $true; return }
+    if (InWsl) { Emit 'WSLNET' 'REFUSE distro DNS is broken; fix .wslconfig (networkingMode=mirrored, dnsTunneling=true) and run wsl --shutdown from Windows PowerShell'; $script:netOk = $false; return }
+    $changed = WslCfgSet $want
+    if (-not $changed) { Emit 'WSLNET' "FAIL distro cannot resolve names although .wslconfig already has networkingMode=mirrored dnsTunneling=true -- check the VPN / Global Secure Access, then run: wsl --shutdown"; $script:netOk = $false; return }
+    $busy = @()
+    foreach ($d in @(Distros | Where-Object { $_.state -eq 'Running' })) {
+        $busy += @(Native 'wsl.exe' @('-d', $d.name, '-u', 'root', '-e', 'sh', '-c', 'command -v docker >/dev/null && docker ps -q 2>/dev/null; command -v tmux >/dev/null && tmux ls 2>/dev/null') -Timeout 30 | Where-Object { $_ -match '\S' })
+    }
+    if ($busy.Count) { Emit 'WSLNET' "REFUSE wrote .wslconfig (mirrored + dnsTunneling) but running containers/tmux ($($busy.Count)) block the restart -- stop them, then: wsl --shutdown ; and run this again"; $script:netOk = $false; return }
+    Step 'WSLNET: .wslconfig -> networkingMode=mirrored dnsTunneling=true; restarting the WSL VM (wsl --shutdown) -- nothing was running'
+    Native 'wsl.exe' @('--shutdown') -Timeout 60 | Out-Null
+    Start-Sleep -Seconds 8
+    $null = DistroVer
+    if (DnsOk) { Emit 'WSLNET' 'did .wslconfig mirrored + dnsTunneling, wsl --shutdown; DNS ok'; $script:netOk = $true; return }
+    Emit 'WSLNET' 'FAIL still no DNS after mirrored + dnsTunneling + restart -- check the VPN / Global Secure Access client'; $script:netOk = $false; return
+}
 $distroUp = [bool](Distros | Where-Object { $_.name -eq $script:D })
 if (-not $Apply) {
-    if ($distroUp) { RunInit '--dry-run' }
+    if ($distroUp) { FixWslNet; RunInit '--dry-run' }
     Emit 'INIT' "WOULD run init.sh --apply ($src) as root in $($script:D): WS_URL=$WsUrl -> /workspace + ./install.sh"
     return (Done)
 }
 if (-not $distroUp) { Emit 'INIT' "FAIL distro $($script:D) not registered"; return (Done) }
+FixWslNet
+if (-not $script:netOk) { return (Done) }
 RunInit '--apply'
 $r = ($script:initOut | Where-Object { $_ -match '^RESULT=' } | Select-Object -Last 1) -replace '^RESULT=', ''
 if ($r -eq 'RESTART_NEEDED') {
