@@ -210,6 +210,18 @@ else
   fi
 fi
 
+# NODE: Windows node.exe -- install.sh stage 6 (tserver) mints the ADO token by running the WAM broker under
+# WINDOWS node at "$MNT/Program Files/nodejs/node.exe" (ado-token.mjs).  The bootstrap installs it (pinned
+# v18.20.6 = c17) and passes INIT_NODE_WIN; here we prove WSL interop can run it.  Absent = WARN (stage 6 fails).
+node_win=""
+[ -n "${INIT_NODE_WIN:-}" ] && node_win="$(wslpath -u "$INIT_NODE_WIN" 2>/dev/null)"
+[ -n "$node_win" ] && [ -f "$node_win" ] || node_win="$MNT/Program Files/nodejs/node.exe"
+if [ -f "$node_win" ]; then
+  nv="$(timeout 20 "$node_win" --version 2>/dev/null | tr -d '\r')"
+  if [ -n "$nv" ]; then say NODE "ok $node_win ($nv)"
+  else say NODE "WARN $node_win present but did not run over WSL interop (tserver stage 6 will give no token)"; fi
+else say NODE "WARN no Windows node.exe at $node_win -- re-run the bootstrap (it installs Node.js v18.20.6); tserver stage 6 needs it"; fi
+
 # LFS
 if ! command -v git >/dev/null 2>&1 || ! git lfs version >/dev/null 2>&1; then say LFS "WOULD git lfs install --system (after APT)"
 elif git config --system --get filter.lfs.process >/dev/null 2>&1; then say LFS ok

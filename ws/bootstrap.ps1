@@ -12,6 +12,8 @@
               step, live progress; no reboot)
       GIT     git.exe; absent -> Git for Windows from its GitHub release (winget only as fallback)
       GCM     `git credential-manager --version`; absent -> comes with Git, else the GCM GitHub release
+      NODE    Windows node.exe (tserver mints the ADO token via WAM under Windows node); absent -> nodejs.org
+              v18.20.6 MSI (pinned = c17), silent msiexec into C:\Program Files\nodejs
       INIT    init.sh (next to this file, else -InitUrl) run as root in the distro: dry-run -> its own dry
               run is shown as `  init: ...` lines; real run -> `init.sh --apply`.  On failure the one-liner to
               re-run is this same bootstrap (everything is idempotent).
@@ -292,6 +294,29 @@ else {
     else { Emit 'GCM' "FAIL git-credential-manager.exe absent after install (rc=$($script:rc)) -- log: $LogFile" }
 }
 
+# NODE: Windows node.exe -- tserver (install.sh stage 6) mints the ADO token by running the WAM broker under
+# WINDOWS node (/mnt/c/Program Files/nodejs/node.exe; the MSAL runtime is a Windows DLL).  A fresh devbox
+# has none -> stage 6 "gave no token".  Pinned to the HOST version proven on c17 (v18.20.6), MSI from nodejs.org, silent msiexec, fixed dir.
+$NodePin = 'https://nodejs.org/dist/v18.20.6/node-v18.20.6-x64.msi'
+$NodeExe = "$env:ProgramFiles\nodejs\node.exe"
+function HaveNode { Test-Path -LiteralPath $NodeExe }
+if (HaveNode) { Emit 'NODE' "ok $NodeExe ($((& $NodeExe --version 2>$null) -join ''))" }
+elseif (-not $Apply) { Emit 'NODE' "WOULD install Node.js 18.20.6 (pinned = c17's Windows node) MSI into $env:ProgramFiles\nodejs" }
+else {
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+    $msi = Join-Path $env:TEMP ($NodePin -split '/')[-1]
+    Step "NODE: download $(($NodePin -split '/')[-1])"
+    try { Start-BitsTransfer -Source $NodePin -Destination $msi -DisplayName 'download node msi' -ErrorAction Stop }
+    catch { Write-Host "  NODE: BITS failed ($($_.Exception.Message)), plain download"
+            try { Invoke-WebRequest -UseBasicParsing $NodePin -OutFile $msi } catch { Write-Host "  NODE: download failed: $($_.Exception.Message)" } }
+    if (Test-Path $msi) { Step 'NODE: msiexec /qn (silent install)'
+        Live 'msiexec.exe' @('/i', $msi, '/qn', '/norestart') -What 'install node.js msi' -Timeout 900
+        Remove-Item $msi -ErrorAction SilentlyContinue }
+    if (-not (HaveNode)) { WingetInstall 'OpenJS.NodeJS.LTS' 'NODE' }
+    if (HaveNode) { Emit 'NODE' "did install Node.js: $NodeExe ($((& $NodeExe --version 2>$null) -join ''))" }
+    else { Emit 'NODE' "FAIL $NodeExe absent after install (rc=$($script:rc)) -- tserver (stage 6) cannot mint the ADO token; log: $LogFile" }
+}
+
 # INIT
 $here = $(if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { '' })
 $local = $(if ($here) { Join-Path $here 'init.sh' } else { '' })
@@ -306,17 +331,19 @@ Step 'GCM: locate git-credential-manager.exe for WSL'
 $GcmWin = GcmExe
 $GitWin = (Get-Command git.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
 Write-Host "  git.exe : $(if ($GitWin) { $GitWin } else { 'NOT FOUND' })" -ForegroundColor Cyan
+$NodeWin = $(if (HaveNode) { $NodeExe } else { '' })
+Write-Host "  node.exe: $(if ($NodeWin) { "$NodeWin ($((& $NodeWin --version 2>$null) -join ''))" } else { 'NOT FOUND (tserver stage 6 will give no token)' })" -ForegroundColor $(if ($NodeWin) { 'Green' } else { 'Red' })
 if ($GcmWin) { Write-Host "  gcm     : $GcmWin" -ForegroundColor Green } else { Write-Host "  gcm     : NOT FOUND (see the 'tried' list above)" -ForegroundColor Red }
 function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding mangling), stdin left to the console
     $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($init -replace "`r`n", "`n")))
-    $cmd = "echo $b64 | base64 -d > /tmp/ws-init.sh && INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_USER='$User' WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode; rc=`$?; rm -f /tmp/ws-init.sh; exit `$rc"
+    $cmd = "echo $b64 | base64 -d > /tmp/ws-init.sh && INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_USER='$User' WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode; rc=`$?; rm -f /tmp/ws-init.sh; exit `$rc"
     $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     if ($mode -eq '--apply') {   # long (apt, clone + ADO auth, lfs, install.sh): run in its OWN Ubuntu window = a real tty,
         # so apt / git clone / lfs draw their native progress and a credential prompt can be answered there.
         # `script` keeps the pty AND logs to /tmp/ws-init.out; this window shows a progress bar + the last log line.
         $ErrorActionPreference = $old
         $run = "rm -f /tmp/ws-init.out; echo $b64 | base64 -d > /tmp/ws-init.sh; " +
-               "export INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
+               "export INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
                "else WS_URL='$WsUrl' bash /tmp/ws-init.sh --apply 2>&1 | tee /tmp/ws-init.out; fi; rc=`$?; rm -f /tmp/ws-init.sh; " +
                "if [ `$rc != 0 ]; then echo; echo 'init.sh FAILED (rc='`$rc') -- see the FAIL line above; press Enter to close'; read x; fi; exit `$rc"
         Step "INIT: init.sh --apply as root in a NEW Ubuntu window ($($script:D)) -- type the password for WSL user '$User' there, then watch apt / git clone / sign-in"
@@ -364,6 +391,7 @@ if ($r -eq 'RESTART_NEEDED') {
     $r = ($script:initOut | Where-Object { $_ -match '^RESULT=' } | Select-Object -Last 1) -replace '^RESULT=', ''
 }
 Emit 'GCMPATH' "win=$(if ($GcmWin) { $GcmWin } else { 'NOT FOUND' }) git=$GitWin"
+Emit 'NODEPATH' "win=$(if ($NodeWin) { $NodeWin } else { 'NOT FOUND' })"
 if ($r -eq 'OK') { Emit 'INIT' "ok init.sh --apply in $($script:D)" }
 else {
     $why = @($script:initOut | Where-Object { $_ -match '=FAIL' }) -join '; '
