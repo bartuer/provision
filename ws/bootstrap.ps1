@@ -8,14 +8,8 @@
     Each step prints KEY=ok|WOULD <action>|FAIL <why>; the last line is RESULT=OK|PLAN|FAIL|REBOOT_NEEDED|
     RESTART_NEEDED|REFUSED.
       ADMIN   elevated?  (a real run needs it for WSL / DISTRO installs)
-      WSL     `wsl --status`; absent -> `wsl --install --no-distribution` (a Windows reboot is then needed:
-              says so and stops)
-      DISTRO  -Distro, else a registered Ubuntu-26.04, else the default distro IF it is Ubuntu 26.04
-              (docker-desktop* ignored).  The fleet is 26.04 only (emacs 30.1 + bin2md need GLIBC 2.43;
-              24.04 has 2.39), so a default distro on another release is LEFT ALONE and Ubuntu-26.04 is
-              installed beside it: `wsl --install -d Ubuntu-26.04 --no-launch` (a .wsl package: no
-              ubuntu2604.exe launcher; init.sh runs as -u root, so no OOBE user is needed)
-      WSL2    version 1 -> `wsl --set-version <distro> 2`
+      WSL     Ubuntu-26.04 on WSL2: absent -> `wsl --install -d Ubuntu-26.04 --no-launch` (engine + distro in one
+              step; a Windows reboot may then be needed: says so and stops, re-run after it)
       GIT     git.exe; absent -> `winget install -e --id Git.Git`
       GCM     `git credential-manager --version`; absent -> comes with Git, else
               `winget install -e --id Microsoft.GitCredentialManagerCore`
@@ -143,60 +137,39 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
            ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 Emit 'ADMIN' $(if ($isAdmin) { 'ok' } else { 'NO (installs of WSL / a distro need an elevated PowerShell)' })
 
-# WSL
+# WSL -- one step, one target: Ubuntu-26.04 on WSL2.  `wsl --install -d Ubuntu-26.04 --no-launch` installs the WSL
+# engine, the Windows features (VirtualMachinePlatform) and the distro, as WSL2 (the default).  A first install
+# asks for a Windows reboot: say so and stop; the re-run after the reboot finds it and moves on.
+$script:D = $(if ($Distro) { $Distro } else { $NewDistro })
+function HaveDistro { [bool](Distros | Where-Object { $_.name -eq $script:D }) }
+function DistroVer { Step "WSL: start $($script:D) (first start can take a minute)"
+    (Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', '. /etc/os-release; echo $ID $VERSION_ID') -Timeout 300 | Select-Object -Last 1) }
 $haveWsl = [bool](Get-Command wsl.exe -ErrorAction SilentlyContinue)
-Step "WSL: wsl --status (timeout 60s; a 'press any key' stub prompt gets EOF)"
-if ($haveWsl) { Native 'wsl.exe' @('--status') -Timeout 60 | Out-Null }
-if ($haveWsl -and $script:rc -eq 0) { Emit 'WSL' 'ok' }
-elseif (-not $Apply) { Emit 'WSL' 'WOULD wsl --install --no-distribution (then a Windows reboot)'; Emit 'DISTRO' "WOULD wsl --install -d $NewDistro --no-launch (after reboot)"; return (Done) }
-elseif (-not $isAdmin) { Emit 'WSL' 'FAIL not admin: re-run from an elevated PowerShell'; return (Done) }
-else {
-    Step 'WSL: wsl --install --no-distribution (downloads WSL; progress below, timeout 30 min)'
-    Native 'wsl.exe' @('--install', '--no-distribution') -Timeout 1800 | Out-Null
-    Native 'wsl.exe' @('--status') -Timeout 60 | Out-Null
-    if ($script:rc -eq 0) { Emit 'WSL' 'did wsl --install --no-distribution' }
-    else { Emit 'WSL' 'did wsl --install --no-distribution -- REBOOT Windows, then run this again'; return (Done 'REBOOT_NEEDED') }
+Step "WSL: is $($script:D) installed? (wsl -l -v)"
+$have = $haveWsl -and (HaveDistro)
+if ($haveWsl -and -not $have -and -not $Distro) {   # an existing default distro that IS ubuntu 26.04 (e.g. named `Ubuntu`): use it
+    $dd = Distros | Where-Object { $_.default -and $_.name -notlike 'docker-desktop*' } | Select-Object -First 1
+    if ($dd) { $keep = $script:D; $script:D = $dd.name
+               if ((DistroVer) -eq "ubuntu $WantVersion") { $have = $true } else { $script:D = $keep } }
 }
-
-# DISTRO
-$all = @(Distros | Where-Object { $_.name -notlike 'docker-desktop*' })
-function DistroVer([string]$n) { Step "DISTRO: release of $n (first start of a distro can take a minute)"
-    (Native 'wsl.exe' @('-d', $n, '-u', 'root', '-e', 'sh', '-c', '. /etc/os-release; echo $ID $VERSION_ID') -Timeout 300 | Select-Object -Last 1) }
-if ($Distro) { $d = $all | Where-Object { $_.name -eq $Distro } | Select-Object -First 1 }
-else {
-    $d = $all | Where-Object { $_.name -eq $NewDistro } | Select-Object -First 1
-    if (-not $d) {
-        $dd = $all | Where-Object { $_.default } | Select-Object -First 1
-        if ($dd) { $v = DistroVer $dd.name
-                   if ($v -eq "ubuntu $WantVersion") { $d = $dd }
-                   else { Emit 'DISTRO' "skip default $($dd.name) ($v) -- not ubuntu $WantVersion, left untouched" } }
-    }
+if (-not $have) {
+    if (-not $Apply) { Emit 'WSL' "WOULD wsl --install -d $($script:D) --no-launch (WSL2; then maybe a Windows reboot)"; return (Done) }
+    if (-not $isAdmin) { Emit 'WSL' 'FAIL not admin: re-run from an elevated PowerShell'; return (Done) }
+    Step "WSL: wsl --install -d $($script:D) --no-launch --web-download (WSL engine + distro, WSL2; progress below, timeout 30 min)"
+    $io = Native 'wsl.exe' @('--install', '-d', $script:D, '--no-launch', '--web-download') -Timeout 1800; $irc = $script:rc
+    if ((($io -join ' ') -match 'reboot|restart') -or -not (HaveDistro)) {
+        Emit 'WSL' "did wsl --install -d $($script:D) (rc=${irc}) -- REBOOT Windows, then run this again"; return (Done 'REBOOT_NEEDED') }
 }
-if ($d) {
-    $v = DistroVer $d.name; $script:D = $d.name
-    if ($v -eq "ubuntu $WantVersion") { Emit 'DISTRO' "ok $($d.name) ($v)" }
-    else { Emit 'DISTRO' "FAIL $($d.name) is '$v', the fleet needs ubuntu $WantVersion (omit -Distro to install $NewDistro beside it)"; return (Done) }
-}
-else {
-    $want = $(if ($Distro) { $Distro } else { $NewDistro }); $script:D = $want
-    if (-not $Apply) { Emit 'DISTRO' "WOULD wsl --install -d $want --no-launch" }
-    else {
-        Step "DISTRO: wsl --install -d $want --no-launch (downloads the distro; progress below, timeout 30 min)"
-        Native 'wsl.exe' @('--install', '-d', $want, '--no-launch') -Timeout 1800 | Out-Null
-        $v = $(if (Distros | Where-Object { $_.name -eq $want }) { DistroVer $want } else { '' })
-        if ($v -eq "ubuntu $WantVersion") { Emit 'DISTRO' "did wsl --install -d $want --no-launch ($v)" }
-        elseif ($v) { Emit 'DISTRO' "FAIL $want installed but reports '$v', not ubuntu $WantVersion"; return (Done) }
-        else { Emit 'DISTRO' "FAIL $want not registered after install (rc=$($script:rc))"; return (Done) }
-    }
-}
-
-# WSL2
 $d = Distros | Where-Object { $_.name -eq $script:D } | Select-Object -First 1
-if (-not $d) { Emit 'WSL2' "WOULD check version of $($script:D) (not installed yet)" }
-elseif ($d.ver -eq 2) { Emit 'WSL2' 'ok' }
-elseif (-not $Apply) { Emit 'WSL2' "WOULD wsl --set-version $($script:D) 2" }
-else { Step "WSL2: wsl --set-version $($script:D) 2"; Native 'wsl.exe' @('--set-version', $script:D, '2') -Timeout 1800 | Out-Null
-       if ($script:rc -eq 0) { Emit 'WSL2' "did wsl --set-version $($script:D) 2" } else { Emit 'WSL2' "FAIL wsl --set-version rc=$($script:rc)" } }
+if ($d.ver -ne 2) {
+    if (-not $Apply) { Emit 'WSL' "WOULD wsl --set-version $($script:D) 2"; return (Done) }
+    Step "WSL: wsl --set-version $($script:D) 2"
+    Native 'wsl.exe' @('--set-version', $script:D, '2') -Timeout 1800 | Out-Null
+    if ($script:rc -ne 0) { Emit 'WSL' "FAIL wsl --set-version $($script:D) 2 rc=$($script:rc) -- REBOOT Windows and run this again"; return (Done 'REBOOT_NEEDED') }
+}
+$v = DistroVer
+if ($v -eq "ubuntu $WantVersion") { Emit 'WSL' "ok $($script:D) WSL2 ($v)" }
+else { Emit 'WSL' "FAIL $($script:D) reports '$v', the fleet needs ubuntu $WantVersion (rc=$($script:rc))"; return (Done) }
 
 # GIT
 if (Get-Command git.exe -ErrorAction SilentlyContinue) { Emit 'GIT' 'ok' }
