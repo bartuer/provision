@@ -424,11 +424,16 @@ sub_lfs_do() {   # ssg_agent (no LFS) clones in the BACKGROUND while the LFS bun
 clone_do() {
   if [ "$ws_state" = empty ]; then rmdir "$WS_DIR" || return 1; fi
   (cd "$(dirname "$WS_DIR")" && GIT_TERMINAL_PROMPT=0 GIT_LFS_SKIP_SMUDGE=1 git clone --progress "$WS_URL" "$(basename "$WS_DIR")") || return 1
-  # Q.5: the public OA base (4.2 GB from mcr) downloads CONCURRENT with the LFS fetch; install.sh stage 9 awaits it
+  # Q.5: the public OA base (4.2 GB from mcr) is pulled in the background; install.sh stage 9 awaits it.
+  # Default: AFTER the LFS fetch, so the two do not split one link (devbox: link-bound, overlap buys nothing and
+  # makes the LFS meter read half speed).  OA_PULL_EARLY=1 = start it before LFS (fleet: mcr-bound, overlap wins).
   # install.sh checks first: a base already present with the pinned layers is NOT pulled again
-  [ "${INIT_SKIP_LFS:-0}" = 1 ] || (cd "$WS_DIR" && ./install.sh --pull-base) 2>/dev/null | grep '^OA base pull:' 
-  sub_lfs_do
+  [ "${OA_PULL_EARLY:-0}" = 1 ] && oa_pull_bg
+  sub_lfs_do; local r=$?
+  [ "${OA_PULL_EARLY:-0}" = 1 ] || [ $r != 0 ] || oa_pull_bg
+  return $r
 }
+oa_pull_bg() { [ "${INIT_SKIP_LFS:-0}" = 1 ] || (cd "$WS_DIR" && ./install.sh --pull-base) 2>/dev/null | grep '^OA base pull:'; }
 sub_missing() { [ "${INIT_SKIP_SUBMODULES:-0}" != 1 ] && git -C "$WS_DIR" submodule status $(sub_paths) 2>/dev/null | grep -q '^-'; }
 SUB_WHAT="$([ "${INIT_SUBMODULES:-0}" = 1 ] && echo "git submodule update $SUB_ARGS" || echo "git submodule update $SUB_ARGS ssg_agent")"
 # UPDATE: an existing clone is fast-forwarded to origin first -- otherwise a re-run resumes the LFS objects of an
