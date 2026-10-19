@@ -392,20 +392,19 @@ function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding man
     $ErrorActionPreference = $old
 }
 if (-not $init) { Emit 'INIT' "FAIL could not download init.sh from $url -- check the network, then run this bootstrap again"; return (Done) }
-# WSLNET -- the FLEET .wslconfig, identical on every box (MEASURED 2026-10-19, 23/23 reachable):
-#   [wsl2] networkingMode=mirrored  vmIdleTimeout=-1
-# A fresh devbox has none: NAT networking (behind Global Secure Access the distro then resolves NOTHING --
-# apt "Temporary failure resolving", even via the host DNS IPs or 1.1.1.1) and the VM idles out, killing
-# the services.  The file is always written (other keys kept, backup .ws-bak); it takes effect only on
-# the next VM start.  `wsl --shutdown` runs ONLY when DNS is broken now AND nothing is running.
-$FleetWslCfg = [ordered]@{ networkingMode = 'mirrored'; vmIdleTimeout = '-1' }
+# WSLNET -- a devbox runs WSL in NAT (the WSL default).  MEASURED 2026-10-19 on a Global Secure Access devbox:
+# mirrored resolves archive.ubuntu.com but every connect is "Network is unreachable"; NAT works.
+# So .wslconfig is ALWAYS exactly [wsl2] networkingMode=nat vmIdleTimeout=-1 (old file -> .ws-bak; takes effect
+# on the next VM start).  Only when the distro cannot reach archive.ubuntu.com NOW: the distro's DNS pins are
+# removed and `wsl --shutdown` runs -- and only when nothing is running.
+$DevWslCfg = [ordered]@{ networkingMode = 'nat'; vmIdleTimeout = '-1' }
 function NetOk {   # DNS AND a TCP connect to archive.ubuntu.com:80 -- "resolves but Network is unreachable" is NOT ok
     $o = InDistro 'timeout 6 getent ahosts archive.ubuntu.com >/dev/null 2>&1 || exit; timeout 10 bash -c "exec 3<>/dev/tcp/archive.ubuntu.com/80" 2>/dev/null && echo NETOK'
     return [bool]($o -match 'NETOK')
 }
 function WslCfgSet($want) {   # CLEAN: .wslconfig becomes exactly the fleet file ([wsl2] + $want, nothing else); returns $true if it changed
     # Extra keys from manual tries (dnsTunneling, firewall, [experimental], proxies) are what broke devboxes:
-    # with Global Secure Access, WSL disables DNS tunneling anyway, and mirrored is what every fleet box runs.
+    # with Global Secure Access, WSL disables DNS tunneling anyway.
     $f = Join-Path $env:USERPROFILE '.wslconfig'
     $out = @('[wsl2]') + @($want.Keys | ForEach-Object { "$_=$($want[$_])" })
     $cur = @(); if (Test-Path $f) { $cur = @(Get-Content $f | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }) }
@@ -420,50 +419,40 @@ function RebootPending {   # Windows Update / CBS / file renames waiting for a r
     return $false
 }
 function FixWslNet {
-    $desc = ($FleetWslCfg.Keys | ForEach-Object { "$_=$($FleetWslCfg[$_])" }) -join ' '
-    $dns = NetOk
+    $desc = ($DevWslCfg.Keys | ForEach-Object { "$_=$($DevWslCfg[$_])" }) -join ' '
+    $net = NetOk
+    $f = Join-Path $env:USERPROFILE '.wslconfig'
+    $want = @('[wsl2]') + @($DevWslCfg.Keys | ForEach-Object { "$_=$($DevWslCfg[$_])" })
+    $isNat = (Test-Path $f) -and ((@(Get-Content $f | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join "`n") -eq ($want -join "`n"))
+    $state = $(if ($net) { 'ok net;' } else { 'net BROKEN;' })
     if (-not $Apply) {
-        Emit 'WSLNET' ("{0} .wslconfig [wsl2] $desc{1}" -f $(if ($dns) { 'ok net;' } else { 'WOULD clean' }), $(if ($dns) { ' (exactly this, applies on next WSL start)' } else { ' + wsl --shutdown (the distro cannot reach archive.ubuntu.com)' }))
+        Emit 'WSLNET' ("$state {0}" -f $(if ($isNat) { ".wslconfig already [wsl2] $desc" } else { "WOULD set .wslconfig [wsl2] $desc" + $(if ($net) { ' (applies on next WSL start)' } else { ' + wsl --shutdown' }) }))
         $script:netOk = $true; return
     }
     if (InWsl) {
-        if ($dns) { Emit 'WSLNET' "ok net (running inside WSL: .wslconfig not checked)"; $script:netOk = $true }
+        if ($net) { Emit 'WSLNET' "ok net (running inside WSL: .wslconfig not checked)"; $script:netOk = $true }
         else { Emit 'WSLNET' "REFUSE distro network is broken; from Windows PowerShell set .wslconfig [wsl2] $desc and run wsl --shutdown"; $script:netOk = $false }
         return
     }
-    $changed = WslCfgSet $FleetWslCfg
-    if ($dns) {
-        Emit 'WSLNET' ("ok net; .wslconfig {0}" -f $(if ($changed) { "cleaned to $desc (applies on next WSL start; no restart now)" } else { 'already fleet' }))
-        $script:netOk = $true; return
-    }
-    foreach ($l in @(InDistro "echo resolv: `$(grep -v '^#' /etc/resolv.conf 2>/dev/null | tr '\n' ' '); ls -l /etc/resolv.conf 2>&1 | sed 's/^/resolv-link: /'; grep -A1 '^\[network\]' /etc/wsl.conf 2>/dev/null | tr '\n' ' ' | sed 's/^/wsl.conf: /'; echo; ip -4 route show default 2>&1 | sed 's/^/route: /'")) { if ("$l".Trim()) { Write-Host "    dns-diag: $l" } }
+    $changed = WslCfgSet $DevWslCfg   # always NAT; takes effect on the next VM start
+    if ($net) { Emit 'WSLNET' ("ok net; .wslconfig {0}" -f $(if ($changed) { "set to [wsl2] $desc (applies on next WSL start; no restart now)" } else { "already [wsl2] $desc" })); $script:netOk = $true; return }
+    NetDiag
+    if (RebootPending) { Emit 'WSLNET' "FAIL WSL cannot reach archive.ubuntu.com and Windows has an update waiting for a REBOOT -- finish the update, reboot, then run this again"; $script:netOk = $false; return }
     $busy = @()
     foreach ($d in @(Distros | Where-Object { $_.state -eq 'Running' })) {
         $busy += @(Native 'wsl.exe' @('-d', $d.name, '-u', 'root', '-e', 'sh', '-c', 'command -v docker >/dev/null && docker ps -q 2>/dev/null; command -v tmux >/dev/null && tmux ls 2>/dev/null') -Timeout 30 | Where-Object { $_ -match '\S' })
     }
-    if ($busy.Count) { Emit 'WSLNET' "REFUSE distro network is broken; .wslconfig is fleet ($desc) but running containers/tmux ($($busy.Count)) block the restart -- stop them, then: wsl --shutdown ; and run this again"; $script:netOk = $false; return }
-    Step "WSLNET: distro network is broken; .wslconfig = [wsl2] $desc only; restarting the WSL VM (wsl --shutdown) -- nothing was running"
-    # clean the distro side too: earlier DNS pins (static resolv.conf, [network] generateResolvConf=false) override WSL's own DNS
+    if ($busy.Count) { Emit 'WSLNET' "REFUSE distro network is broken; .wslconfig is now [wsl2] $desc but running containers/tmux ($($busy.Count)) block the restart -- stop them, then: wsl --shutdown ; and run this again"; $script:netOk = $false; return }
+    Step "WSLNET: distro network is broken; .wslconfig = [wsl2] $desc; restarting the WSL VM (wsl --shutdown) -- nothing was running"
+    # earlier DNS pins (static resolv.conf, generateResolvConf=false) would override WSL's own DNS
     $null = InDistro "sed -i '/^generateResolvConf/d' /etc/wsl.conf 2>/dev/null; [ -L /etc/resolv.conf ] || rm -f /etc/resolv.conf"
     Native 'wsl.exe' @('--shutdown') -Timeout 60 | Out-Null
     Start-Sleep -Seconds 8
     $null = DistroVer
-    if (NetOk) { Emit 'WSLNET' "did clean .wslconfig ($desc) + distro DNS pins + wsl --shutdown; net ok"; $script:netOk = $true; return }
+    if (NetOk) { Emit 'WSLNET' "did .wslconfig [wsl2] $desc + wsl --shutdown; net ok"; $script:netOk = $true; return }
     NetDiag
-    if (RebootPending) { Emit 'WSLNET' "FAIL WSL cannot reach archive.ubuntu.com and Windows has an update waiting for a REBOOT -- finish the update, reboot, then run this again"; $script:netOk = $false; return }
-    # Windows reaches it, mirrored WSL does not (Global Secure Access / Hyper-V firewall outbound policy): fall back to NAT
-    $nat = [ordered]@{ networkingMode = 'nat'; vmIdleTimeout = '-1' }
-    Step "WSLNET: mirrored cannot reach archive.ubuntu.com; trying NAT ([wsl2] networkingMode=nat) + wsl --shutdown"
-    $null = WslCfgSet $nat
-    Native 'wsl.exe' @('--shutdown') -Timeout 60 | Out-Null
-    Start-Sleep -Seconds 8
-    $null = DistroVer
-    if (NetOk) { Emit 'WSLNET' "did .wslconfig networkingMode=nat (mirrored was blocked on this box) + wsl --shutdown; net ok"; $script:netOk = $true; return }
-    NetDiag
-    $null = WslCfgSet $FleetWslCfg   # back to the fleet file; NAT did not help either
-    # not fatal: init.sh's NET step still tries the host / public nameservers (Global Secure Access hands out
-    # 6.6.x.x addresses only its Windows client can route) and prints net: lines if that fails too
-    Emit 'WSLNET' "WARN archive.ubuntu.com unreachable from WSL in mirrored and nat mode (Windows reaches it) -- init.sh will try other nameservers; net-diag lines above"; $script:netOk = $true
+    # not fatal: init.sh's NET step still tries the host / public nameservers and prints net: lines if that fails too
+    Emit 'WSLNET' "WARN archive.ubuntu.com unreachable from WSL with [wsl2] $desc (Windows reaches it) -- init.sh will try other nameservers; net-diag lines above"; $script:netOk = $true
 }
 function NetDiag {   # why WSL cannot get out while Windows can: proxy, Hyper-V firewall, in-distro route + the real error
     try { $ie = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -EA Stop
