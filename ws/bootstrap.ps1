@@ -97,7 +97,7 @@ function Native([string]$exe, [string[]]$a, [int]$Timeout = 120, [string]$Tag = 
         if ($t -gt $Timeout) {
             try { $p.Kill() } catch {}
             if ($script:crOpen) { Write-Host ''; $script:crOpen = $false }
-            Write-Host "  ${Tag}: TIMEOUT after $([int]$t)s -- killed: $cmdline"; $script:rc = 1460; return @($out)
+            Write-Host "  ${Tag}: TIMEOUT after $([int]$t)s -- stopped this wsl.exe CLIENT only (the WSL VM and distros keep running): $cmdline"; $script:rc = 1460; return @($out)
         }
         if ($t - $last -ge 15) { if ($script:crOpen) { Write-Host ''; $script:crOpen = $false }
                                  Write-Host "  ${Tag}: ... still running $([int]$t)s (timeout ${Timeout}s): $cmdline"; $last = $t }
@@ -144,14 +144,14 @@ function InWsl {   # this PowerShell started from a WSL shell (interop)?  then t
 function RefreshPath { $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User') }
 function Distros {   # @{name=..; ver=..; default=$bool} from `wsl -l -v`
     $r = @()
-    foreach ($l in (Native 'wsl.exe' @('-l','-v'))) {
+    foreach ($l in (Native 'wsl.exe' @('-l','-v') -Timeout 20 -Tag 'wsl -l -v')) {   # answers in <2s; a hang = the WSL service is stuck, not slow
         if ($l -match '^\s*(\*)?\s*(\S+)\s+(Running|Stopped|Installing|Converting|Uninstalling)\s+(\d)\s*$') {
             $r += [pscustomobject]@{ name = $Matches[2]; ver = [int]$Matches[4]; default = [bool]$Matches[1] }
         }
     }
     return $r
 }
-function InDistro([string]$cmd) { return Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', $cmd) }
+function InDistro([string]$cmd) { return Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', $cmd) -Timeout 30 }
 
 function Main {
 Write-Output "MODE=$(if ($Apply) { 'apply' } else { 'dry-run' })"
@@ -167,7 +167,7 @@ Emit 'ADMIN' $(if ($isAdmin) { 'ok' } else { 'NO (installs of WSL / a distro nee
 $script:D = $(if ($Distro) { $Distro } else { $NewDistro })
 function HaveDistro { [bool](Distros | Where-Object { $_.name -eq $script:D }) }
 function DistroVer { Step "WSL: start $($script:D) (first start can take a minute)"
-    (Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', '. /etc/os-release; echo $ID $VERSION_ID') -Timeout 300 | Select-Object -Last 1) }
+    (Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', '. /etc/os-release; echo $ID $VERSION_ID') -Timeout 90 | Select-Object -Last 1) }
 $haveWsl = [bool](Get-Command wsl.exe -ErrorAction SilentlyContinue)
 Step "WSL: is $($script:D) installed? (wsl -l -v)"
 $have = $haveWsl -and (HaveDistro)
