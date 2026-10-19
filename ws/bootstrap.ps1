@@ -9,7 +9,7 @@
     RESTART_NEEDED|REFUSED.
       ADMIN   elevated?  (a real run needs it for WSL / DISTRO installs)
       WSL     Ubuntu-26.04 on WSL2: absent -> `wsl --install -d Ubuntu-26.04 --no-launch` (engine + distro in one
-              step; a Windows reboot may then be needed: says so and stops, re-run after it)
+              step, live progress; no reboot)
       GIT     git.exe; absent -> `winget install -e --id Git.Git`
       GCM     `git credential-manager --version`; absent -> comes with Git, else
               `winget install -e --id Microsoft.GitCredentialManagerCore`
@@ -100,12 +100,34 @@ function Native([string]$exe, [string[]]$a, [int]$Timeout = 120, [string]$Tag = 
         if ($t - $last -ge 15) { if ($script:crOpen) { Write-Host ''; $script:crOpen = $false }
                                  Write-Host "  ${Tag}: ... still running $([int]$t)s (timeout ${Timeout}s): $cmdline"; $last = $t }
         if (-not $busy) { Start-Sleep -Milliseconds 100 }
+        if ($t -ge 2) { Write-Progress -Activity "${Tag}: $cmdline" -Status ("{0}s elapsed (timeout {1}s)" -f [int]$t, $Timeout) -PercentComplete ([math]::Min(99, [int](100 * $t / $Timeout))) }
     }
     if ($script:crOpen) { Write-Host ''; $script:crOpen = $false }
     $p.WaitForExit(); $script:rc = $p.ExitCode
+    Write-Progress -Activity "${Tag}: $cmdline" -Completed
     return @($out)
 }
 function Step([string]$m) { Write-Host "-- $m" }
+function Live([string]$exe, [string[]]$a, [int]$Timeout = 1800, [string]$What = '') {
+    # run a long native step ON THIS CONSOLE (not redirected), so wsl.exe / winget draw their own % progress bar;
+    # on top, a PowerShell progress bar shows the step and its elapsed time.  Killed after $Timeout s (rc 1460).
+    if (-not $What) { $What = "$exe $($a -join ' ')" }
+    $path = (Get-Command $exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    if (-not $path) { $script:rc = 9009; Write-Host "  not found: $exe"; return }
+    try { $p = Start-Process -FilePath $path -ArgumentList (($a | ForEach-Object { Q $_ }) -join ' ') -NoNewWindow -PassThru }
+    catch { $script:rc = 9009; Write-Host "  start failed: $_"; return }
+    $null = $p.Handle   # PS 5.1: without touching Handle, ExitCode reads $null after exit
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while (-not $p.WaitForExit(1000)) {
+        $t = [int]$sw.Elapsed.TotalSeconds
+        Write-Progress -Activity $What -Status ("{0}m{1:d2}s elapsed (timeout {2}m)" -f [int][math]::Floor($t / 60), ($t % 60), [int]($Timeout / 60)) -PercentComplete ([math]::Min(99, [int](100 * $t / $Timeout)))
+        if ($t -gt $Timeout) { try { $p.Kill() } catch {}; Write-Progress -Activity $What -Completed
+                               Write-Host "  TIMEOUT after ${t}s -- killed: $What"; $script:rc = 1460; return }
+    }
+    $p.WaitForExit(); Write-Progress -Activity $What -Completed
+    $script:rc = $p.ExitCode
+    Write-Host ("  {0}: rc={1} in {2}s" -f $What, $script:rc, [int]$sw.Elapsed.TotalSeconds)
+}
 function InWsl {   # this PowerShell started from a WSL shell (interop)?  then terminating the distro kills us
     if ($env:WSL_DISTRO_NAME) { return $true }
     $id = $PID
@@ -155,17 +177,17 @@ if ($haveWsl -and -not $have -and -not $Distro) {   # an existing default distro
 if (-not $have) {
     if (-not $Apply) { Emit 'WSL' "WOULD wsl --install -d $($script:D) --no-launch (WSL2; then maybe a Windows reboot)"; return (Done) }
     if (-not $isAdmin) { Emit 'WSL' 'FAIL not admin: re-run from an elevated PowerShell'; return (Done) }
-    Step "WSL: wsl --install -d $($script:D) --no-launch --web-download (WSL engine + distro, WSL2; progress below, timeout 30 min)"
-    $io = Native 'wsl.exe' @('--install', '-d', $script:D, '--no-launch', '--web-download') -Timeout 1800; $irc = $script:rc
-    if ((($io -join ' ') -match 'reboot|restart') -or -not (HaveDistro)) {
-        Emit 'WSL' "did wsl --install -d $($script:D) (rc=${irc}) -- REBOOT Windows, then run this again"; return (Done 'REBOOT_NEEDED') }
+    Step "WSL: wsl --install -d $($script:D) --no-launch --web-download (WSL engine + distro, WSL2; wsl's own progress below)"
+    Live 'wsl.exe' @('--install', '-d', $script:D, '--no-launch', '--web-download') -What "wsl --install -d $($script:D)"
+    if (-not (HaveDistro)) { Emit 'WSL' "FAIL $($script:D) not registered after wsl --install (rc=$($script:rc)) -- if wsl asked for a Windows reboot, reboot and run this again"; return (Done) }
+    Emit 'WSL' "did wsl --install -d $($script:D) --no-launch --web-download"
 }
 $d = Distros | Where-Object { $_.name -eq $script:D } | Select-Object -First 1
 if ($d.ver -ne 2) {
     if (-not $Apply) { Emit 'WSL' "WOULD wsl --set-version $($script:D) 2"; return (Done) }
     Step "WSL: wsl --set-version $($script:D) 2"
-    Native 'wsl.exe' @('--set-version', $script:D, '2') -Timeout 1800 | Out-Null
-    if ($script:rc -ne 0) { Emit 'WSL' "FAIL wsl --set-version $($script:D) 2 rc=$($script:rc) -- REBOOT Windows and run this again"; return (Done 'REBOOT_NEEDED') }
+    Live 'wsl.exe' @('--set-version', $script:D, '2') -What "wsl --set-version $($script:D) 2"
+    if ($script:rc -ne 0) { Emit 'WSL' "FAIL wsl --set-version $($script:D) 2 rc=$($script:rc)"; return (Done) }
 }
 $v = DistroVer
 if ($v -eq "ubuntu $WantVersion") { Emit 'WSL' "ok $($script:D) WSL2 ($v)" }
@@ -175,7 +197,7 @@ else { Emit 'WSL' "FAIL $($script:D) reports '$v', the fleet needs ubuntu $WantV
 if (Get-Command git.exe -ErrorAction SilentlyContinue) { Emit 'GIT' 'ok' }
 elseif (-not $Apply) { Emit 'GIT' 'WOULD winget install -e --id Git.Git' }
 else { Step 'GIT: winget install Git.Git (timeout 30 min)'
-       Native 'winget.exe' -Timeout 1800 -a @('install', '-e', '--id', 'Git.Git', '--silent', '--accept-package-agreements', '--accept-source-agreements') | Out-Null
+       Live 'winget.exe' -a @('install', '-e', '--id', 'Git.Git', '--silent', '--accept-package-agreements', '--accept-source-agreements')
        RefreshPath
        if (Get-Command git.exe -ErrorAction SilentlyContinue) { Emit 'GIT' 'did winget install Git.Git' } else { Emit 'GIT' "FAIL winget install Git.Git rc=$($script:rc)" } }
 
@@ -185,7 +207,7 @@ if (Get-Command git.exe -ErrorAction SilentlyContinue) { Native 'git.exe' @('cre
 if ($gcmOk) { Emit 'GCM' 'ok' }
 elseif (-not $Apply) { Emit 'GCM' 'WOULD (ships with Git for Windows) else winget install -e --id Microsoft.GitCredentialManagerCore' }
 else { Step 'GCM: winget install Microsoft.GitCredentialManagerCore (timeout 30 min)'
-       Native 'winget.exe' -Timeout 1800 -a @('install', '-e', '--id', 'Microsoft.GitCredentialManagerCore', '--silent', '--accept-package-agreements', '--accept-source-agreements') | Out-Null
+       Live 'winget.exe' -a @('install', '-e', '--id', 'Microsoft.GitCredentialManagerCore', '--silent', '--accept-package-agreements', '--accept-source-agreements')
        RefreshPath; Native 'git.exe' @('credential-manager', '--version') | Out-Null
        if ($script:rc -eq 0) { Emit 'GCM' 'did winget install GitCredentialManagerCore' } else { Emit 'GCM' 'FAIL git credential-manager still absent' } }
 
@@ -201,6 +223,15 @@ function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding man
     $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($init -replace "`r`n", "`n")))
     $cmd = "echo $b64 | base64 -d > /tmp/ws-init.sh && WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode; rc=`$?; rm -f /tmp/ws-init.sh; exit `$rc"
     $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    if ($mode -eq '--apply') {   # long (apt, clone, lfs, install.sh): ON THE CONSOLE so git/apt draw their progress bars;
+        # stdout is tee'd to /tmp/ws-init.out to read RESULT= back, stderr (where git prints progress) stays on the tty
+        $ErrorActionPreference = $old
+        $cmd = "echo $b64 | base64 -d > /tmp/ws-init.sh && WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode | tee /tmp/ws-init.out; rc=`${PIPESTATUS[0]}; rm -f /tmp/ws-init.sh; exit `$rc"
+        Step "INIT: init.sh --apply as root in $($script:D) (apt / git clone / install.sh progress below)"
+        Live 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', $cmd) -Timeout 7200 -What "init.sh --apply in $($script:D)"
+        $rc0 = $script:rc; $script:initOut = @(InDistro 'cat /tmp/ws-init.out 2>/dev/null'); $script:rc = $rc0
+        return
+    }
     Step "INIT: init.sh $mode as root in $($script:D) (live output below)"
     $script:initOut = @(& wsl.exe -d $script:D -u root -e bash -c $cmd 2>&1 | ForEach-Object { $l = "$_"; Write-Host "  init: $l"; $l }); $script:rc = $LASTEXITCODE
     $ErrorActionPreference = $old
