@@ -437,6 +437,8 @@ function FixWslNet {
     }
     if ($busy.Count) { Emit 'WSLNET' "REFUSE wrote .wslconfig (mirrored + dnsTunneling) but running containers/tmux ($($busy.Count)) block the restart -- stop them, then: wsl --shutdown ; and run this again"; $script:netOk = $false; return }
     Step 'WSLNET: .wslconfig -> networkingMode=mirrored dnsTunneling=true; restarting the WSL VM (wsl --shutdown) -- nothing was running'
+    # undo an earlier init.sh DNS pin (static resolv.conf + generateResolvConf=false): it would override the tunnel
+    $null = InDistro "if grep -q '^generateResolvConf = false' /etc/wsl.conf 2>/dev/null; then sed -i '/^\[network\]$/{N;/generateResolvConf = false/d}' /etc/wsl.conf; rm -f /etc/resolv.conf; fi"
     Native 'wsl.exe' @('--shutdown') -Timeout 60 | Out-Null
     Start-Sleep -Seconds 8
     $null = DistroVer
