@@ -262,16 +262,30 @@ elseif ($url) { $src = $url; try { $init = (Invoke-RestMethod -UseBasicParsing $
 if (-not $User) { $User = "$env:USERNAME".ToLower() -replace '[^a-z0-9_-]', '' }
 if ($User -notmatch '^[a-z][a-z0-9_-]{0,31}$') { $User = 'dev' }
 $oneLiner = $(if ($url) { "curl -fsSL '$url' | WS_URL='$WsUrl' bash -s -- --apply" } else { "WS_URL='$WsUrl' bash init.sh --apply   # init.sh from the bootstrap gist" })
+function GcmExe {   # the Windows git-credential-manager.exe, as the WSL /mnt/<drive>/... path init.sh hands to git
+    $c = @()
+    $g = (Get-Command git.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    if ($g) { $root = Split-Path (Split-Path $g -Parent) -Parent   # ...\Git\cmd\git.exe -> ...\Git
+              $c += "$root\mingw64\bin\git-credential-manager.exe", "$root\mingw64\libexec\git-core\git-credential-manager.exe" }
+    $c += (Get-Command git-credential-manager.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, "$env:LOCALAPPDATA\Programs")) {
+        if ($pf) { $c += "$pf\Git Credential Manager\git-credential-manager.exe", "$pf\Git\mingw64\bin\git-credential-manager.exe" } }
+    $hit = $c | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if (-not $hit) { return '' }
+    return '/mnt/' + $hit.Substring(0, 1).ToLower() + ($hit.Substring(2) -replace '\\', '/')
+}
+$GcmWsl = GcmExe
+if ($GcmWsl) { Write-Host "  gcm: $GcmWsl" }
 function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding mangling), stdin left to the console
     $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($init -replace "`r`n", "`n")))
-    $cmd = "echo $b64 | base64 -d > /tmp/ws-init.sh && INIT_USER='$User' WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode; rc=`$?; rm -f /tmp/ws-init.sh; exit `$rc"
+    $cmd = "echo $b64 | base64 -d > /tmp/ws-init.sh && INIT_GCM='$GcmWsl' INIT_USER='$User' WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode; rc=`$?; rm -f /tmp/ws-init.sh; exit `$rc"
     $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     if ($mode -eq '--apply') {   # long (apt, clone + ADO auth, lfs, install.sh): run in its OWN Ubuntu window = a real tty,
         # so apt / git clone / lfs draw their native progress and a credential prompt can be answered there.
         # `script` keeps the pty AND logs to /tmp/ws-init.out; this window shows a progress bar + the last log line.
         $ErrorActionPreference = $old
         $run = "rm -f /tmp/ws-init.out; echo $b64 | base64 -d > /tmp/ws-init.sh; " +
-               "export INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
+               "export INIT_GCM='$GcmWsl' INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
                "else WS_URL='$WsUrl' bash /tmp/ws-init.sh --apply 2>&1 | tee /tmp/ws-init.out; fi; rc=`$?; rm -f /tmp/ws-init.sh; " +
                "if [ `$rc != 0 ]; then echo; echo 'init.sh FAILED (rc='`$rc') -- see the FAIL line above; press Enter to close'; read x; fi; exit `$rc"
         Step "INIT: init.sh --apply as root in a NEW Ubuntu window ($($script:D)) -- type the password for WSL user '$User' there, then watch apt / git clone / sign-in"

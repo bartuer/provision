@@ -162,6 +162,7 @@ fi
 
 # GCM
 gcm="${INIT_GCM:-}"
+[ -n "$gcm" ] && [ ! -x "$gcm" ] && gcm=""   # a stale path from the caller: search instead
 if [ -z "$gcm" ]; then
   for g in "$MNT/Program Files/Git/mingw64/bin/git-credential-manager.exe" \
            "$MNT/Program Files/Git/mingw64/libexec/git-core/git-credential-manager.exe" \
@@ -170,7 +171,10 @@ if [ -z "$gcm" ]; then
     [ -x "$g" ] && { gcm="$g"; break; }
   done
 fi
-if [ -z "$gcm" ]; then say GCM "WARN no Windows git-credential-manager.exe under $MNT (install Git for Windows; ADO auth then prompts in the terminal)"
+if [ -z "$gcm" ]; then
+  # ADO refuses a typed password, so a clone without GCM can only fail: stop here, before git prompts for one
+  if [ "$ws_state" != clone ] && [ "$APPLY" = 1 ]; then bad GCM "no Windows git-credential-manager.exe under $MNT -- the bootstrap installs Git for Windows (it brings GCM); re-run it"; finish; fi
+  say GCM "WARN no Windows git-credential-manager.exe under $MNT"
 elif ! command -v git >/dev/null 2>&1; then say GCM "WOULD credential.helper -> $gcm (after APT)"
 else
   helper="$(printf '%s' "$gcm" | sed 's/ /\\ /g')"
@@ -201,7 +205,7 @@ lfs_do() {
 }
 clone_do() {
   if [ "$ws_state" = empty ]; then rmdir "$WS_DIR" || return 1; fi
-  (cd "$(dirname "$WS_DIR")" && GIT_LFS_SKIP_SMUDGE=1 git clone --progress "$WS_URL" "$(basename "$WS_DIR")") || return 1
+  (cd "$(dirname "$WS_DIR")" && GIT_TERMINAL_PROMPT=0 GIT_LFS_SKIP_SMUDGE=1 git clone --progress "$WS_URL" "$(basename "$WS_DIR")") || return 1
   git -C "$WS_DIR" config lfs.concurrenttransfers 8 || return 1
   # Q.5: the public OA base (4.2 GB from mcr) downloads CONCURRENT with the LFS fetch; install.sh stage 9 awaits it
   [ "${INIT_SKIP_LFS:-0}" = 1 ] || (cd "$WS_DIR" && ./install.sh --pull-base) >/dev/null 2>&1
