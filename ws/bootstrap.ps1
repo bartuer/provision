@@ -332,6 +332,9 @@ $GcmWin = GcmExe
 $GitWin = (Get-Command git.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
 Write-Host "  git.exe : $(if ($GitWin) { $GitWin } else { 'NOT FOUND' })" -ForegroundColor Cyan
 $NodeWin = $(if (HaveNode) { $NodeExe } else { '' })
+# the host's IPv4 DNS servers, for init.sh's DNS repair when the distro cannot resolve
+$DnsWin = ''
+try { $DnsWin = ((Get-DnsClientServerAddress -AddressFamily IPv4 -EA Stop | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' -and $_ -notmatch '^(127|169\.254)\.' } | Select-Object -Unique) -join ' ') } catch {}
 Write-Host "  node.exe: $(if ($NodeWin) { "$NodeWin ($((& $NodeWin --version 2>$null) -join ''))" } else { 'NOT FOUND (tserver stage 6 will give no token)' })" -ForegroundColor $(if ($NodeWin) { 'Green' } else { 'Red' })
 if ($GcmWin) { Write-Host "  gcm     : $GcmWin" -ForegroundColor Green } else { Write-Host "  gcm     : NOT FOUND (see the 'tried' list above)" -ForegroundColor Red }
 function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding mangling), stdin left to the console
@@ -339,14 +342,14 @@ function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding man
     # init.sh goes over STDIN: its base64 (~33 KB) on the command line exceeds the 32767-char Windows limit
     # ("The filename or extension is too long" -- init.sh then never starts).  Only short commands go on argv.
     $null = ($b64 | & wsl.exe -d $script:D -u root -e sh -c "tr -d '\r\n' | base64 -d > /tmp/ws-init.sh" 2>&1)
-    $cmd = "INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_USER='$User' WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode; rc=`$?; rm -f /tmp/ws-init.sh; exit `$rc"
+    $cmd = "INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_DNS_WIN='$DnsWin' INIT_USER='$User' WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode; rc=`$?; rm -f /tmp/ws-init.sh; exit `$rc"
     $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     if ($mode -eq '--apply') {   # long (apt, clone + ADO auth, lfs, install.sh): run in its OWN Ubuntu window = a real tty,
         # so apt / git clone / lfs draw their native progress and a credential prompt can be answered there.
         # `script` keeps the pty AND logs to /tmp/ws-init.out; this window shows a progress bar + the last log line.
         $ErrorActionPreference = $old
         $run = "rm -f /tmp/ws-init.out; " +
-               "export INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
+               "export INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_DNS_WIN='$DnsWin' INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
                "else WS_URL='$WsUrl' bash /tmp/ws-init.sh --apply 2>&1 | tee /tmp/ws-init.out; fi; rc=`$?; rm -f /tmp/ws-init.sh; echo `$rc > /tmp/ws-init.rc; " +
                "if [ `$rc != 0 ]; then echo; echo 'init.sh FAILED (rc='`$rc') -- see the FAIL line above; press Enter to close'; read x; fi; exit `$rc"
         Step "INIT: init.sh --apply as root in a NEW Ubuntu window ($($script:D)) -- type the password for WSL user '$User' there, then watch apt / git clone / sign-in"

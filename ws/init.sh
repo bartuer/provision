@@ -106,6 +106,26 @@ elif user_ok; then
   else say USER "ok $U"; fi
 else act USER "useradd $U (sudo), /etc/wsl.conf [user] default=$U, passwd" user_do; fi
 
+# DNS -- "Temporary failure resolving" on apt = the distro's resolver is dead (VPN / dnsTunneling / stale
+# generated resolv.conf).  Probe; on failure try the Windows host's DNS servers (INIT_DNS_WIN from the
+# bootstrap), then public ones; keep the first that resolves.  Nothing changes when DNS already works.
+dns_ok() { timeout 5 getent ahosts "${1:-archive.ubuntu.com}" >/dev/null 2>&1; }
+dns_do() {
+  local bak=/etc/resolv.conf.ws-bak c
+  [ -e "$bak" ] || cp -aL /etc/resolv.conf "$bak" 2>/dev/null || true
+  for c in ${INIT_DNS_WIN:-} 1.1.1.1 8.8.8.8; do
+    rm -f /etc/resolv.conf 2>/dev/null; printf 'nameserver %s\n' "$c" > /etc/resolv.conf
+    dns_ok && { echo "dns: using nameserver $c" >&2
+      # keep it across WSL restarts: WSL would regenerate the broken file
+      grep -q '^generateResolvConf' /etc/wsl.conf 2>/dev/null || printf '\n[network]\ngenerateResolvConf = false\n' >> /etc/wsl.conf
+      return 0; }
+  done
+  [ -e "$bak" ] && cp -a "$bak" /etc/resolv.conf
+  echo "dns: no nameserver resolves archive.ubuntu.com (tried: ${INIT_DNS_WIN:-} 1.1.1.1 8.8.8.8) -- check the VPN / proxy" >&2
+  return 1
+}
+if dns_ok; then say DNS ok; else act DNS "fix /etc/resolv.conf (current resolver cannot resolve archive.ubuntu.com)" dns_do || finish; fi
+
 # APT
 missing=""
 have_pkg() {   # a tool already on PATH counts (docker-ce instead of docker.io, a source-built git)
@@ -118,14 +138,30 @@ have_pkg() {   # a tool already on PATH counts (docker-ce instead of docker.io, 
   dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'ok installed'
 }
 for p in $PKGS; do have_pkg "$p" || missing="$missing $p"; done
-apt_do() {   # on a tty (the bootstrap's Ubuntu window): apt's own progress; else quiet
-  if [ -t 1 ]; then
-    apt-get update && apt-get install -y --no-install-recommends $missing   # shellcheck disable=SC2086
-  else
-    apt-get update -qq >/dev/null 2>&1
+apt_do() {   # tty: apt's own progress; else quiet.  Survives a fresh distro's usual failures, shows the real error.
+  local o=(-o DPkg::Lock::Timeout=300 -o Acquire::Retries=3) log=/tmp/ws-apt.log i
+  export DEBIAN_FRONTEND=noninteractive
+  : > "$log"
+  # an interrupted earlier run leaves dpkg half-configured -> every install fails until this runs
+  dpkg --configure -a >>"$log" 2>&1 || true
+  for i in 1 2 3; do
+    if [ -t 1 ]; then apt-get "${o[@]}" update 2>&1 | tee -a "$log"; else apt-get "${o[@]}" update -qq >>"$log" 2>&1; fi
+    grep -qE '^(E|Err):' "$log" || break
+    echo "apt-get update: errors (try $i) -- $(grep -E '^(E|Err):' "$log" | tail -1)" >&2
+    [ $i = 2 ] && rm -rf /var/lib/apt/lists/* && echo "apt: cleared /var/lib/apt/lists, retrying" >&2
+    : > "$log"; sleep 3
+  done
+  # shellcheck disable=SC2086
+  if [ -t 1 ]; then apt-get "${o[@]}" install -y --no-install-recommends $missing 2>&1 | tee -a "$log"; rc=${PIPESTATUS[0]}
+  else apt-get "${o[@]}" install -y -qq --no-install-recommends $missing >>"$log" 2>&1; rc=$?; fi
+  if [ "$rc" != 0 ]; then
+    # one more go after fixing broken deps
+    apt-get "${o[@]}" -f install -y >>"$log" 2>&1
     # shellcheck disable=SC2086
-    apt-get install -y -qq --no-install-recommends $missing >/dev/null 2>&1
+    apt-get "${o[@]}" install -y -qq --no-install-recommends $missing >>"$log" 2>&1; rc=$?
   fi
+  [ "$rc" = 0 ] || { echo "apt failed (rc=$rc), last errors from $log:" >&2; grep -E '^(E|Err|W):' "$log" | tail -5 >&2; tail -3 "$log" >&2; }
+  return "$rc"
 }
 if [ -z "$missing" ]; then say APT ok; else act APT "apt-get install$missing" apt_do || finish; fi
 
