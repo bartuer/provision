@@ -253,6 +253,7 @@ else {
 function GcmExe {   # the Windows git-credential-manager.exe (WINDOWS path; init.sh converts it with wslpath)
     RefreshPath
     $c = New-Object System.Collections.Generic.List[string]
+    $c.Add("$env:ProgramFiles\Git Credential Manager\git-credential-manager.exe")   # the standalone install (preferred)
     $g = (Get-Command git.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
     if ($g) {
         try { $ep = (& $g --exec-path 2>$null | Select-Object -First 1) -replace '/', '\' } catch { $ep = '' }   # ...\mingw64\libexec\git-core
@@ -274,14 +275,21 @@ function GcmExe {   # the Windows git-credential-manager.exe (WINDOWS path; init
     if (-not $hit) { Write-Host "  gcm: NOT FOUND (git.exe=$g; tried: $($c -join ' | '))"; return '' }
     return $hit
 }
-if (HaveGcm) { Emit 'GCM' "ok $(GcmExe) (git.exe credential-manager works)" }
-elseif (-not $Apply) { Emit 'GCM' 'WOULD install Git Credential Manager from github.com/git-ecosystem/git-credential-manager' }
-elseif (-not (HaveGit)) { Emit 'GCM' 'FAIL needs git.exe (see GIT)' }
+# GCM: always the STANDALONE installer (user ruling 2026-10-19: it is what pops the sign-in window for the
+# ADO clone from WSL), pinned, into a fixed dir so init.sh gets one known path.
+$GcmPin = 'https://github.com/git-ecosystem/git-credential-manager/releases/download/v2.7.3/gcm-win-x64-2.7.3.exe'
+$GcmDir = "$env:ProgramFiles\Git Credential Manager"
+function HaveGcmStd { Test-Path -LiteralPath "$GcmDir\git-credential-manager.exe" }
+if (HaveGcmStd) { Emit 'GCM' "ok $GcmDir\git-credential-manager.exe ($((& "$GcmDir\git-credential-manager.exe" --version 2>$null) -join ''))" }
+elseif (-not $Apply) { Emit 'GCM' "WOULD install standalone Git Credential Manager 2.7.3 (pinned) into $GcmDir" }
 else {
-    # only reached when the installed git lacks its bundled GCM: standalone, pinned to the 2.x line
-    GhInstall 'git-ecosystem/git-credential-manager' '' $inno 'GCM' 'https://github.com/git-ecosystem/git-credential-manager/releases/download/v2.7.3/gcm-win-x64-2.7.3.exe'
-    if (-not (HaveGcm)) { WingetInstall 'Git.GCM' 'GCM' }
-    if (HaveGcm) { Emit 'GCM' "did install Git Credential Manager: $(GcmExe)" } else { Emit 'GCM' "FAIL git credential-manager still absent (rc=$($script:rc)) -- log: $LogFile" }
+    GhInstall 'git-ecosystem/git-credential-manager' '' ($inno + @("/DIR=$GcmDir")) 'GCM' $GcmPin
+    if (-not (HaveGcmStd)) { GhInstall 'git-ecosystem/git-credential-manager' '^gcm-win-x64-[\d.]+\.exe$' ($inno + @("/DIR=$GcmDir")) 'GCM' }
+    if (-not (HaveGcmStd)) { WingetInstall 'Git.GCM' 'GCM' }
+    $x = GcmExe
+    if (HaveGcmStd) { Emit 'GCM' "did install Git Credential Manager: $GcmDir\git-credential-manager.exe" }
+    elseif ($x) { Emit 'GCM' "did install Git Credential Manager (not in $GcmDir): $x" }
+    else { Emit 'GCM' "FAIL git-credential-manager.exe absent after install (rc=$($script:rc)) -- log: $LogFile" }
 }
 
 # INIT

@@ -169,7 +169,8 @@ fi
 if [ -n "$gcm" ] && [ ! -f "$gcm" ]; then gcm_why=" (given '${INIT_GCM_WIN:-$gcm}' -> '$gcm': not a file; is $MNT mounted? $(ls -d "$MNT" 2>&1 | head -1))"; gcm=""; fi
 [ -z "${INIT_GCM_WIN:-}${INIT_GCM:-}" ] && gcm_why=" (the bootstrap passed no path)"
 if [ -z "$gcm" ]; then
-  for g in "$MNT/Program Files/Git/mingw64/bin/git-credential-manager.exe" \
+  for g in "$MNT/Program Files/Git Credential Manager/git-credential-manager.exe" \
+           "$MNT/Program Files/Git/mingw64/bin/git-credential-manager.exe" \
            "$MNT/Program Files/Git/mingw64/libexec/git-core/git-credential-manager.exe" \
            "$MNT"/Program\ Files*/Git\ Credential\ Manager*/git-credential-manager*.exe \
            "$MNT"/Users/*/AppData/Local/Programs/Git/mingw64/bin/git-credential-manager.exe; do
