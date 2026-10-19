@@ -210,27 +210,74 @@ else act LFS "git lfs install --system" sh -c 'git lfs install --system >/dev/nu
 # lfs.concurrenttransfers=8 instead.
 SUB_ARGS="--init --progress --depth 1 --single-branch --jobs 6"
 sub_paths() { [ "${INIT_SUBMODULES:-0}" = 1 ] || echo ssg_agent; }
-sub_do() { git -C "$WS_DIR" submodule update $SUB_ARGS $(sub_paths); }
-lfs_do() {
+sub_do() {   # ssg_agent carries ~250 MB of LFS (archive/*.tar.gz): the checkout smudge fetches those ONE at a time
+  # (~5 min), so skip it and `lfs pull` them in parallel afterwards
+  GIT_TERMINAL_PROMPT=0 GIT_LFS_SKIP_SMUDGE=1 git -C "$WS_DIR" submodule update $SUB_ARGS $(sub_paths) || return 1
   [ "${INIT_SKIP_LFS:-0}" = 1 ] && return 0
-  git -C "$WS_DIR" config lfs.concurrenttransfers 8 && git -C "$WS_DIR" lfs pull
+  git -C "$WS_DIR" submodule foreach --quiet 'git config lfs.concurrenttransfers '"$LFS_JOBS"' && git lfs pull && echo "LFS $sm_path: $(git lfs ls-files | wc -l) objects"'
+}
+LFS_JOBS="${INIT_LFS_JOBS:-16}"   # parallel LFS downloads (126 MB parts; one stream is ~4 MB/s)
+lfs_do() {   # foreground, so its meter owns the tty: "Downloading LFS objects: 45% (35/78), 2.7 GB | 40 MB/s"
+  [ "${INIT_SKIP_LFS:-0}" = 1 ] && return 0
+  git -C "$WS_DIR" config lfs.concurrenttransfers "$LFS_JOBS" || return 1
+  local n tot; n="$(git -C "$WS_DIR" lfs ls-files 2>/dev/null | wc -l)"
+  tot="$(git -C "$WS_DIR" lfs ls-files -s 2>/dev/null | sed -n 's/.*(\([0-9.]*\) \([KMG]\)B)$/\1 \2/p' | awk '{m=($2=="G")?1024:($2=="K")?1/1024:1; t+=$1*m} END {printf "%.1f GB", t/1024}')"
+  echo "LFS: $n objects, $tot, $LFS_JOBS downloads in parallel"
+  # details: GIT_LFS_PROGRESS gets "download <i>/<n> <got>/<size> <path>" per update; lfs_watch turns it into
+  # one line per finished file + a status line every 5s (git's own \r meter would scramble with these)
+  local prog=/tmp/ws-lfs.progress; : >"$prog"
+  lfs_watch "$prog" "$n" & local w=$!
+  GIT_LFS_PROGRESS="$prog" git -C "$WS_DIR" lfs pull 2>/tmp/ws-lfs.err; local rc=$?
+  sleep 1; kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
+  lfs_status "$prog" "$n" final
+  [ $rc = 0 ] || { echo "LFS: git lfs pull FAILED (rc=$rc):"; tail -20 /tmp/ws-lfs.err; }
+  return $rc
+}
+lfs_status() {   # one summary line from the progress file: files done, bytes, rate, files in flight
+  awk -v n="$2" -v tag="$3" -v t0="${LFS_T0:-0}" -v now="$(date +%s)" '
+    $1=="download" { split($3,b,"/"); p=$4; for(i=5;i<=NF;i++) p=p" "$i; got[p]=b[1]; sz[p]=b[2] }
+    END { d=0; g=0; fl=""; nf=0
+          for (p in got) { g+=got[p]; if (got[p]>=sz[p]) d++; else { nf++; if (nf<=3) { k=p; sub(/.*\//,"",k); fl=fl " " k " " int(100*got[p]/sz[p]) "%" } } }
+          el=now-t0; if (el<1) el=1
+          printf "LFS %s: %d/%d files, %.2f GB, %.1f MB/s, %ds%s\n", (tag?tag:"progress"), d, n, g/1073741824, g/1048576/el, el, (nf? ", in flight " nf ":" fl : "") }' "$1"
+}
+lfs_watch() {    # "LFS done 12/78 archive/x.tar.gz.03 (126 MB)" per finished file, status every 5s
+  local prog="$1" n="$2" seen=0 i=0
+  export LFS_T0; LFS_T0="$(date +%s)"
+  while sleep 1; do
+    awk -v seen="$seen" '$1=="download" { split($3,b,"/"); if (b[1]>=b[2] && !(($4) in done)) { done[$4]=1; c++; if (c>seen) { split($2,f,"/"); printf "LFS done %s %s (%.0f MB)\n", $2, $4, b[2]/1048576 } } } END { }' "$prog"
+    seen="$(awk '$1=="download" { split($3,b,"/"); if (b[1]>=b[2]) d[$4]=1 } END { print length(d)+0 }' "$prog")"
+    i=$((i+1)); [ $((i % 5)) = 0 ] && lfs_status "$prog" "$n"
+  done
+}
+sub_lfs_do() {   # ssg_agent (no LFS) clones in the BACKGROUND while the LFS bundles download; its log -> /tmp/ws-sub.log
+  local pid=""
+  if [ "${INIT_SKIP_SUBMODULES:-0}" != 1 ]; then
+    echo "SUBMODULE: $SUB_WHAT in background (log /tmp/ws-sub.log)"
+    sub_do >/tmp/ws-sub.log 2>&1 & pid=$!
+  fi
+  lfs_do; local lrc=$?
+  if [ -n "$pid" ]; then
+    kill -0 "$pid" 2>/dev/null && echo "SUBMODULE: waiting for ssg_agent ..."
+    wait "$pid" || { echo "SUBMODULE: FAILED:"; tail -20 /tmp/ws-sub.log; return 1; }
+    echo "SUBMODULE: ssg_agent done ($(grep -c . /tmp/ws-sub.log) log lines; $(grep '^LFS ' /tmp/ws-sub.log | tr '\n' ' '))"
+  fi
+  return $lrc
 }
 clone_do() {
   if [ "$ws_state" = empty ]; then rmdir "$WS_DIR" || return 1; fi
   (cd "$(dirname "$WS_DIR")" && GIT_TERMINAL_PROMPT=0 GIT_LFS_SKIP_SMUDGE=1 git clone --progress "$WS_URL" "$(basename "$WS_DIR")") || return 1
-  git -C "$WS_DIR" config lfs.concurrenttransfers 8 || return 1
   # Q.5: the public OA base (4.2 GB from mcr) downloads CONCURRENT with the LFS fetch; install.sh stage 9 awaits it
   [ "${INIT_SKIP_LFS:-0}" = 1 ] || (cd "$WS_DIR" && ./install.sh --pull-base) >/dev/null 2>&1
-  if [ "${INIT_SKIP_SUBMODULES:-0}" != 1 ]; then sub_do || return 1; fi
-  lfs_do
+  sub_lfs_do
 }
 sub_missing() { [ "${INIT_SKIP_SUBMODULES:-0}" != 1 ] && git -C "$WS_DIR" submodule status $(sub_paths) 2>/dev/null | grep -q '^-'; }
 SUB_WHAT="$([ "${INIT_SUBMODULES:-0}" = 1 ] && echo "git submodule update $SUB_ARGS" || echo "git submodule update $SUB_ARGS ssg_agent")"
 if [ "$ws_state" = clone ]; then
-  if sub_missing; then resume_do() { sub_do && lfs_do; }
+  if sub_missing; then resume_do() { sub_lfs_do; }
   act CLONE "$SUB_WHAT (resume) + git lfs pull" resume_do || finish
   else say CLONE ok; fi
-else act CLONE "cd $(dirname "$WS_DIR") && git clone $WS_URL + $SUB_WHAT + git lfs pull (lfs.concurrenttransfers=8)" clone_do || finish; fi
+else act CLONE "cd $(dirname "$WS_DIR") && git clone $WS_URL + $SUB_WHAT + git lfs pull (lfs.concurrenttransfers=$LFS_JOBS, ssg_agent in parallel)" clone_do || finish; fi
 
 # INSTALL
 if [ "${INIT_SKIP_INSTALL:-0}" = 1 ]; then say INSTALL "skip (INIT_SKIP_INSTALL=1)"
