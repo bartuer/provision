@@ -233,6 +233,7 @@ lfs_do() {   # foreground, so its meter owns the tty: "Downloading LFS objects: 
   git -C "$WS_DIR" lfs pull 2>/tmp/ws-lfs.err; local rc=$?
   kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
   lfs_status "$WS_DIR" "$map" "$n" "$LFS_T0" final
+  oa_pull_status
   [ $rc = 0 ] || { echo "LFS: git lfs pull FAILED (rc=$rc):"; tr '\r' '\n' </tmp/ws-lfs.err | tail -20; }
   return $rc
 }
@@ -245,6 +246,15 @@ lfs_status() {   # dir map n t0 [tag]: files done, GB, MB/s since t0, bytes in f
   awk -v d="$d" -v n="$3" -v g="${g:-0}" -v f="${f:-0}" -v el="$el" -v tag="${5:-progress}" -v g0="${LFS_G0:-0}" \
     'BEGIN { printf "LFS %s: %d/%d files, %.2f GB, %.1f MB/s, %dm%02ds\n", tag, d, n, (g+f)/1073741824, (g+f-g0)/1048576/el, el/60, el%60 }'
 }
+oa_pull_status() {   # one line: background docker pull of the OA base (install.sh --pull-base)
+  local L=/tmp/ws-oa-pull.log t0 n c mb
+  [ -s "$L" ] || return 0
+  t0="$(sed -n 's/^t0=\([0-9]*\).*/\1/p' "$L" | head -1)"
+  if grep -q '^rc=' "$L"; then echo "OA base pull: $(grep '^rc=' "$L" | tail -1)"; return 0; fi
+  n="$(grep -c ': Pulling fs layer' "$L")"; c="$(grep -c ': Pull complete' "$L")"
+  mb="$(du -sm /var/lib/containerd/io.containerd.content.v1.content/ingest 2>/dev/null | cut -f1)"
+  echo "OA base pull: layers $c/$n done, ${mb:-?} MB in flight, $(( ($(date +%s) - ${t0:-$(date +%s)}) / 60 ))m (background, shares bandwidth)"
+}
 lfs_watch() {    # dir map n: "LFS done 12/78 archive/x.tar.gz.03 (126 MB)" per finished file, status every 10s
   local t0="${LFS_T0:-$(date +%s)}" i=0 done c=0 oid name size
   done="$(lfs_have "$1")"; c="$(lfs_have "$1" | grep -cFf - <(cut -f1 "$2"))"
@@ -255,6 +265,7 @@ lfs_watch() {    # dir map n: "LFS done 12/78 archive/x.tar.gz.03 (126 MB)" per 
       done="$done $oid"; c=$((c+1)); echo "LFS done $c/$3 $name ($size)"
     done <"$2"
     i=$((i+1)); [ $((i % 5)) = 0 ] && lfs_status "$1" "$2" "$3" "$t0"
+    [ $((i % 15)) = 0 ] && oa_pull_status
   done
 }
 sub_lfs_do() {   # ssg_agent (no LFS) clones in the BACKGROUND while the LFS bundles download; its log -> /tmp/ws-sub.log
