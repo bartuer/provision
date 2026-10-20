@@ -150,12 +150,19 @@ have_pkg() {   # a tool already on PATH counts (docker-ce instead of docker.io, 
   case "$1" in
     git) command -v git >/dev/null 2>&1 && return 0 ;;
     git-lfs) command -v git-lfs >/dev/null 2>&1 && return 0 ;;
-    docker.io) command -v docker >/dev/null 2>&1 && return 0 ;;
+    # the ENGINE counts, not a CLI: a cloud PC image can carry a bare docker CLI / Docker Desktop's WSL shim
+    # (/usr/bin/docker -> /mnt/wsl/docker-desktop/...) with no dockerd and no docker.service (measured
+    # 2026-10-20: "systemctl enable docker" fails, docker.service inactive, journal empty) -> install docker.io
+    docker.io) command -v dockerd >/dev/null 2>&1 && { [ ! -d /run/systemd/system ] || systemctl cat docker.service >/dev/null 2>&1; } && return 0 ;;
     curl) command -v curl >/dev/null 2>&1 && return 0 ;;
   esac
   dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'ok installed'
 }
 for p in $PKGS; do have_pkg "$p" || missing="$missing $p"; done
+# docker.io conflicts with Docker's own docker-ce-cli (seen on cloud PC images): its apt repo is then configured,
+# so take the engine from there instead
+case " $missing " in *" docker.io "*) dpkg-query -W -f='${Status}' docker-ce-cli 2>/dev/null | grep -q 'ok installed' \
+  && missing="$(echo "$missing" | sed 's/ docker\.io/ docker-ce containerd.io/')";; esac
 apt_do() {   # tty: apt's own progress; else quiet.  Survives a fresh distro's usual failures, shows the real error.
   local o=(-o DPkg::Lock::Timeout=300 -o Acquire::Retries=3) log=/tmp/ws-apt.log i
   export DEBIAN_FRONTEND=noninteractive
@@ -191,6 +198,10 @@ fi
 # DOCKERD
 docker_up()      { command -v docker >/dev/null 2>&1 && docker info --format '{{.ServerVersion}}' >/dev/null 2>&1; }
 has_systemd()    { [ -d /run/systemd/system ]; }
+docker_why()     {   # one line: which piece is missing (CLI, engine, unit) and what systemd/journal say
+  local c; c="$(command -v docker 2>/dev/null)"
+  echo "cli=${c:-none}$([ -n "$c" ] && [ "$(readlink -f "$c")" != "$c" ] && echo "->$(readlink -f "$c")") dockerd=$(command -v dockerd || echo none) unit=$(systemctl cat docker.service >/dev/null 2>&1 && echo yes || echo none) active=$(systemctl is-active docker.service 2>&1) enable=$(systemctl enable docker.service 2>&1 | tail -1 | cut -c1-120) journal=$(journalctl -u docker.service -n 1 --no-pager 2>/dev/null | tail -1 | cut -c1-120)"
+}
 docker_wait()    { [ "$APPLY" = 1 ] || return 0; local i; for i in $(seq 1 "${INIT_DOCKER_WAIT:-60}"); do docker_up && return 0; sleep 1; done; return 1; }
 wslconf_systemd(){ grep -qiE '^[[:space:]]*systemd[[:space:]]*=[[:space:]]*true' /etc/wsl.conf 2>/dev/null; }
 write_wslconf() {   # systemd=true under [boot]; every other line kept
@@ -220,7 +231,7 @@ if docker_up; then say DOCKERD ok
 elif has_systemd; then
   act DOCKERD "systemctl enable --now docker" sh -c 'systemctl enable --now docker.service >/dev/null 2>&1'
   docker_wait
-  if [ "$APPLY" = 1 ] && ! docker_up; then bad DOCKERD "docker.service enabled but docker info fails: $(systemctl is-active docker.service 2>&1) $(journalctl -u docker.service -n 1 --no-pager 2>/dev/null | cut -c1-160)"; fi
+  if [ "$APPLY" = 1 ] && ! docker_up; then bad DOCKERD "docker info fails: $(docker_why)"; fi
 elif is_wsl; then
   # no systemd yet: write wsl.conf for the next boot, but start dockerd by hand NOW so this run goes on
   # (no wsl --terminate mid-bootstrap); only when that fails is a restart needed
