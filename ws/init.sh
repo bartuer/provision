@@ -191,6 +191,7 @@ fi
 # DOCKERD
 docker_up()      { command -v docker >/dev/null 2>&1 && docker info --format '{{.ServerVersion}}' >/dev/null 2>&1; }
 has_systemd()    { [ -d /run/systemd/system ]; }
+docker_wait()    { [ "$APPLY" = 1 ] || return 0; local i; for i in $(seq 1 "${INIT_DOCKER_WAIT:-60}"); do docker_up && return 0; sleep 1; done; return 1; }
 wslconf_systemd(){ grep -qiE '^[[:space:]]*systemd[[:space:]]*=[[:space:]]*true' /etc/wsl.conf 2>/dev/null; }
 write_wslconf() {   # systemd=true under [boot]; every other line kept
   local f=/etc/wsl.conf t; t="$(mktemp)"
@@ -208,7 +209,7 @@ dockercfg_ok() { grep -q '"max-concurrent-downloads"' /etc/docker/daemon.json 2>
 dockercfg_do() {   # only creates a MISSING daemon.json; restarts dockerd only when it runs no container
   mkdir -p /etc/docker && printf '{\n  "max-concurrent-downloads": %s\n}\n' "$DOCKER_JOBS" > /etc/docker/daemon.json || return 1
   if docker_up && has_systemd; then
-    if [ -z "$(docker ps -q 2>/dev/null)" ]; then systemctl restart docker.service >/dev/null 2>&1
+    if [ -z "$(docker ps -q 2>/dev/null)" ]; then systemctl restart docker.service >/dev/null 2>&1; docker_wait
     else echo "DOCKERCFG: containers running -- dockerd keeps 3 until its next restart"; fi
   fi
 }
@@ -218,11 +219,16 @@ else act DOCKERCFG "/etc/docker/daemon.json max-concurrent-downloads=$DOCKER_JOB
 if docker_up; then say DOCKERD ok
 elif has_systemd; then
   act DOCKERD "systemctl enable --now docker" sh -c 'systemctl enable --now docker.service >/dev/null 2>&1'
-  if [ "$APPLY" = 1 ] && ! docker_up; then bad DOCKERD "docker.service enabled but docker info fails"; fi
+  docker_wait
+  if [ "$APPLY" = 1 ] && ! docker_up; then bad DOCKERD "docker.service enabled but docker info fails: $(systemctl is-active docker.service 2>&1) $(journalctl -u docker.service -n 1 --no-pager 2>/dev/null | cut -c1-160)"; fi
 elif is_wsl; then
-  restart=1
-  if wslconf_systemd; then say DOCKERD "RESTART NEEDED -- /etc/wsl.conf has systemd=true; from Windows: wsl --terminate ${WSL_DISTRO_NAME:-<distro>}, then re-run"
-  else act DOCKERD "[boot] systemd=true -> /etc/wsl.conf, then RESTART NEEDED (wsl --terminate ${WSL_DISTRO_NAME:-<distro>})" write_wslconf; fi
+  # no systemd yet: write wsl.conf for the next boot, but start dockerd by hand NOW so this run goes on
+  # (no wsl --terminate mid-bootstrap); only when that fails is a restart needed
+  wslconf_systemd || act DOCKERD "[boot] systemd=true -> /etc/wsl.conf (dockerd via systemd from the next distro start)" write_wslconf
+  act DOCKERD "start dockerd now (no systemd in this boot; log /var/log/dockerd.log)" sh -c 'nohup dockerd >/var/log/dockerd.log 2>&1 &'
+  docker_wait
+  if [ "$APPLY" = 1 ] && ! docker_up; then restart=1
+    say DOCKERD "RESTART NEEDED -- dockerd did not start ($(tail -1 /var/log/dockerd.log 2>/dev/null | cut -c1-160)); from Windows: wsl --terminate ${WSL_DISTRO_NAME:-<distro>}, then re-run"; fi
 else
   say DOCKERD "WARN no docker server, no systemd, not WSL -- start dockerd yourself"
 fi
@@ -409,11 +415,18 @@ clone_do() {
   # Default: AFTER the LFS fetch, so the two do not split one link (devbox: link-bound, overlap buys nothing and
   # makes the LFS meter read half speed).  OA_PULL_EARLY=1 = start it before LFS (fleet: mcr-bound, overlap wins).
   # install.sh checks first: a base already present with the pinned layers is NOT pulled again
-  [ "${OA_PULL_EARLY:-0}" = 1 ] && oa_pull_bg
+  oa_early && oa_pull_bg
   sub_lfs_do; local r=$?
-  [ "${OA_PULL_EARLY:-0}" = 1 ] || [ $r != 0 ] || oa_pull_bg
+  oa_early || [ $r != 0 ] || oa_pull_bg
   return $r
 }
+# OA_PULL_EARLY: 1 = during LFS, 0 = after, auto (default) = during on a cloud PC (hostname CPC-*, ~100 MB/s:
+# measured 2026-10-20 the LFS fetch alone does not fill the link), after it elsewhere (laptop: link-bound)
+oa_early() {
+  case "${OA_PULL_EARLY:-auto}" in 1) return 0;; 0) return 1;; esac
+  case "$(hostname 2>/dev/null)" in [Cc][Pp][Cc]-*) return 0;; esac; return 1
+}
+oa_wrap() { oa_early && oa_pull_bg; "$@"; local r=$?; oa_early || [ $r != 0 ] || oa_pull_bg; return $r; }   # resume paths too
 oa_pull_bg() { [ "${INIT_SKIP_LFS:-0}" = 1 ] || (cd "$WS_DIR" && ./install.sh --pull-base) 2>/dev/null | grep '^OA base pull:'; }
 sub_missing() { [ "${INIT_SKIP_SUBMODULES:-0}" != 1 ] && git -C "$WS_DIR" submodule status $(sub_paths) 2>/dev/null | grep -q '^-'; }
 SUB_WHAT="$([ "${INIT_SUBMODULES:-0}" = 1 ] && echo "git submodule update $SUB_ARGS" || echo "git submodule update $SUB_ARGS ssg_agent")"
@@ -442,12 +455,12 @@ behind() {   # the clone is clean and origin has commits it lacks (fetch first; 
 }
 if [ "$ws_state" = clone ]; then
   if behind; then
-    resume_do() { update_do || return 1; if sub_missing; then sub_lfs_do; else lfs_do; fi; }
+    resume_do() { update_do || return 1; if sub_missing; then oa_wrap sub_lfs_do; else oa_wrap lfs_do; fi; }
     act CLONE "git fast-forward to origin + $(sub_missing && echo "$SUB_WHAT (resume) + ")git lfs pull" resume_do || finish
-  elif sub_missing; then resume_do() { sub_lfs_do; }
+  elif sub_missing; then resume_do() { oa_wrap sub_lfs_do; }
     act CLONE "$SUB_WHAT (resume) + git lfs pull" resume_do || finish
   elif [ -n "$(lfs_missing)" ]; then   # measured 2026-10-19: an interrupted pull (91/115) re-ran as CLONE=ok
-    act CLONE "git lfs pull (resume: $(lfs_missing | wc -l) LFS files not downloaded yet)" lfs_do || finish
+    act CLONE "git lfs pull (resume: $(lfs_missing | wc -l) LFS files not downloaded yet)" oa_wrap lfs_do || finish
   else say CLONE ok; fi
 else act CLONE "cd $(dirname "$WS_DIR") && git clone $WS_URL + $SUB_WHAT + git lfs pull (lfs.concurrenttransfers=$LFS_JOBS, ssg_agent in parallel)" clone_do || finish; fi
 
