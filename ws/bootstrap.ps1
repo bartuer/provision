@@ -459,6 +459,37 @@ else {
     }
 }
 
+# M365 (cluster plan 96 H, bin/m365-sca.sh): Shared Computer Activation -- Office licenses this box without
+# taking one of the account's ~5 device seats ("you've reached the device limit").  SCA licence = 30 days,
+# Office renews it itself at each launch.  The seat files of an earlier activation are backed up then removed;
+# seats already counted stay until removed at https://myaccount.microsoft.com/device-list (human).
+$ScaK1 = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
+$ScaK2 = 'HKLM:\SOFTWARE\Policies\Microsoft\Office\16.0\Common\Licensing'
+$SeatDir = "$env:LOCALAPPDATA\Microsoft\Office\Licenses\5"
+function ScaOn { ("$((Get-ItemProperty $ScaK1 -ErrorAction SilentlyContinue).SharedComputerLicensing)" -eq '1') -and ("$((Get-ItemProperty $ScaK2 -ErrorAction SilentlyContinue).SharedComputerLicensing)" -eq '1') }
+function Seats { @(Get-ChildItem -LiteralPath $SeatDir -File -ErrorAction SilentlyContinue).Count }
+if ($env:WS_SKIP_M365 -eq '1') { Emit 'M365' 'skip (WS_SKIP_M365=1)' }
+elseif (-not (Test-Path -LiteralPath $ExcelExe)) { Emit 'M365' 'n/a (no Office)' }
+elseif ((ScaOn) -and (Seats) -eq 0) { Emit 'M365' 'ok shared computer activation on, 0 device-seat files' }
+elseif (-not $Apply) { Emit 'M365' "WOULD turn on shared computer activation (SharedComputerLicensing=1 in C2R + policy) and back up/remove $(Seats) device-seat file(s) in $SeatDir" }
+elseif (-not $isAdmin) { Emit 'M365' 'FAIL need an elevated PowerShell to turn on shared computer activation' }
+else {
+    Step 'M365: shared computer activation (no device seat; fixes the M365 device limit)'
+    if (Test-Path $ScaK1) { Set-ItemProperty -Path $ScaK1 -Name 'SharedComputerLicensing' -Value '1' -Type String }
+    if (-not (Test-Path $ScaK2)) { New-Item -Path $ScaK2 -Force | Out-Null }
+    Set-ItemProperty -Path $ScaK2 -Name 'SharedComputerLicensing' -Value 1 -Type DWord
+    $n = Seats; $bk = ''
+    if ($n -gt 0) {
+        if (Get-Process -Name EXCEL,WINWORD,POWERPNT,OUTLOOK -ErrorAction SilentlyContinue) { Write-Host '  M365: an Office app is running -- seat files left in place (close Office and run again to drop them)' -ForegroundColor Yellow }
+        else {
+            $bk = "C:\temp\ws-office\m365-backup.$(Get-Date -Format yyyyMMddTHHmm)"; New-Item -ItemType Directory -Path $bk -Force | Out-Null
+            Copy-Item -Path "$SeatDir\*" -Destination $bk -Force; Remove-Item -Path "$SeatDir\*" -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (ScaOn) { Emit 'M365' "did turn on shared computer activation; seat files $n -> $(Seats)$(if ($bk) { " (backup $bk)" }) -- the next Excel start signs in and mints a 30-day SCA licence; still blocked? remove old devices at https://myaccount.microsoft.com/device-list" }
+    else { Emit 'M365' 'FAIL SharedComputerLicensing did not stick (an Intune/Cloud PC policy may own it)' }
+}
+
 # INIT
 $here = $(if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { '' })
 $local = $(if ($here) { Join-Path $here 'init.sh' } else { '' })
