@@ -475,7 +475,8 @@ if ($r -eq 'OK') {
     # a TUI inside the init window filled /tmp/ws-init.out with binary and replaced the window).  $env:WS_CLI=0 skips.
     if ($env:WS_CLI -ne '0') {
         $path = (Get-Command wsl.exe).Source
-        $cli = @('-d', $script:D, '-u', 'root', '-e', 'docker', 'exec', '-it', 'officeagent-dev', 'bash', '-ic', 't main || echo "GHCP CLI exited rc=$? -- staying in the container shell (t = copilot in tmux, h = pick model, ec = emacs)"; exec bash -i')
+        $cli = @('-d', $script:D, '-u', 'root', '-e', 'docker', 'exec', '-it', 'officeagent-dev', 'bash', '-ic', 't main || echo "GHCP CLI exited rc=$? -- staying in the container shell (t = copilot in tmux, h = pick model, ec = emacs)" && exec bash -i')
+        # NO ';' in $cli: wt.exe splits its command line on ';' (a 2nd tab ran 'exec' -> 'cannot find the file specified')
         $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
         if ($wt -and $env:WS_WT -ne '0') { Start-Process -FilePath $wt.Source -ArgumentList ((@('-w', 'new', 'new-tab', '--title', 'GHCP CLI (officeagent-dev)', $path) + $cli | ForEach-Object { Q $_ }) -join ' ') }
         else { Start-Process -FilePath $path -ArgumentList (($cli | ForEach-Object { Q $_ }) -join ' ') }
