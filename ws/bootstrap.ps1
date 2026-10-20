@@ -322,7 +322,8 @@ else {
 # build already there is kept (no downgrade); 20301 is never accepted (deterministic mso40uiwin32client.dll crash on
 # the Copilot FAB, OfficeAgent KNOWN-ISSUES F24).  Auto-update off at 3 layers so the pin holds.
 $ExcelPin    = $(if ($env:WS_EXCEL_PIN) { $env:WS_EXCEL_PIN } else { '16.0.20306.20002' })
-$DevMainCdn  = 'http://officecdn.microsoft.com/pr/ea4a4090-de26-49d7-93c1-91bff9e53fc3'
+$DevMainGuid = 'ea4a4090-de26-49d7-93c1-91bff9e53fc3'
+$DevMainCdn  = "http://officecdn.microsoft.com/pr/$DevMainGuid"
 $OdtUrl      = 'https://officecdn.microsoft.com/pr/wsus/setup.exe'
 $ExcelExe    = "$env:ProgramFiles\Microsoft Office\root\Office16\EXCEL.EXE"
 $C2rCfg      = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
@@ -335,33 +336,56 @@ function ExcelNeed([string]$ver, [string]$aud, [string]$upd, [string]$pin = '16.
     if ("$upd" -ne 'False') { return 'updates-off' }
     return 'none'
 }
+# Office auto-update off -- parity with OfficeAgent eval/host/install/disable-office-updates.ps1 (the cluster's own
+# harness only verifies; OA is the source): it rolled DevMain back to Beta/InsiderFast and dropped the add-in flights.
+# Any ONE layer can turn updates back on, so ALL must hold: (1) HKLM policy enableautomaticupdates=0 + updatetoversion
+# pinned to the installed build + updatepath on the DevMain CDN (never updatebranch=InsiderFast: 5440fd1f is not DevMain);
+# (2) C2R Configuration UpdatesEnabled=False + UpdateChannel/UpdateUrl on the DevMain CDN (a Cloud PC was found with
+# UpdateChannel=InsiderFast); (3) every updater-family scheduled task disabled; (4) a running OfficeC2RClient is killed so
+# it cannot re-persist the old values.
+$OfficeUpdTasks = @('Office Automatic Updates*','Office Feature Updates*','OfficeTelemetry*','Office ClickToRun Service*',
+                    '*OfficeUpdate*','Office Serviceability Manager*','Office Background Push Maintenance*')
+function OfficeUpdTaskOn { @(Get-ScheduledTask -TaskPath '\Microsoft\Office\' -ErrorAction SilentlyContinue | Where-Object { $n = $_.TaskName; $_.State -ne 'Disabled' -and ($OfficeUpdTasks | Where-Object { $n -like $_ }) }) }
 function ExcelState {
     $v = ''; if (Test-Path -LiteralPath $ExcelExe) { $v = (Get-Item -LiteralPath $ExcelExe).VersionInfo.ProductVersion }
     $c = Get-ItemProperty $C2rCfg -ErrorAction SilentlyContinue
-    $tasks = @(Get-ScheduledTask -TaskName 'Office Automatic Updates*','Office Feature Updates*' -ErrorAction SilentlyContinue | Where-Object { $_.State -ne 'Disabled' })
-    $pol = (Get-ItemProperty $OfficePol -ErrorAction SilentlyContinue).enableautomaticupdates
-    # updates count as off only when ALL 3 layers are off
-    $upd = $(if ("$($c.UpdatesEnabled)" -eq 'False' -and $pol -eq 0 -and $tasks.Count -eq 0) { 'False' } else { 'True' })
-    [pscustomobject]@{ ver = $v; aud = "$($c.AudienceData)"; upd = $upd; c2rUpd = "$($c.UpdatesEnabled)"; pol = $pol; tasks = $tasks.Count }
+    $tasks = OfficeUpdTaskOn
+    $p = Get-ItemProperty $OfficePol -ErrorAction SilentlyContinue; $pol = $p.enableautomaticupdates
+    $chan = $(if ("$($c.UpdateChannel)$($c.UpdateUrl)" -and ("$($c.UpdateChannel)" -notmatch $DevMainGuid -or "$($c.UpdateUrl)" -notmatch $DevMainGuid)) { 'off-devmain' } else { 'devmain' })
+    $pin = $(if ($v -and "$($p.updatetoversion)" -ne $v) { 'unpinned' } else { 'pinned' })
+    # updates count as off only when EVERY layer holds
+    $upd = $(if ("$($c.UpdatesEnabled)" -eq 'False' -and $pol -eq 0 -and $tasks.Count -eq 0 -and $chan -eq 'devmain' -and $pin -eq 'pinned') { 'False' } else { 'True' })
+    [pscustomobject]@{ ver = $v; aud = "$($c.AudienceData)"; upd = $upd; c2rUpd = "$($c.UpdatesEnabled)"; pol = $pol; tasks = $tasks.Count; chan = $chan; pin = $pin }
 }
 function ExcelUpdatesOff {
-    New-Item -Path $OfficePol -Force | Out-Null
+    foreach ($n in @('OfficeC2RClient','OfficeClickToRun')) { Get-Process -Name $n -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
+    if (-not (Test-Path $OfficePol)) { New-Item -Path $OfficePol -Force | Out-Null }
     Set-ItemProperty -Path $OfficePol -Name 'enableautomaticupdates' -Value 0 -Type DWord
-    if (Test-Path $C2rCfg) { Set-ItemProperty -Path $C2rCfg -Name 'UpdatesEnabled' -Value 'False' -Type String }
-    Get-ScheduledTask -TaskName 'Office Automatic Updates*','Office Feature Updates*' -ErrorAction SilentlyContinue | Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+    Set-ItemProperty -Path $OfficePol -Name 'hideupdatenotifications' -Value 1 -Type DWord
+    Set-ItemProperty -Path $OfficePol -Name 'updatepath' -Value $DevMainCdn -Type String
+    Remove-ItemProperty -Path $OfficePol -Name 'updatebranch','updatedeadline' -ErrorAction SilentlyContinue
+    $v = $(if (Test-Path -LiteralPath $ExcelExe) { (Get-Item -LiteralPath $ExcelExe).VersionInfo.ProductVersion } else { '' })
+    if ($v) { Set-ItemProperty -Path $OfficePol -Name 'updatetoversion' -Value $v -Type String }   # the build we HAVE (never downgrade a newer DevMain)
+    if (Test-Path $C2rCfg) {
+        Set-ItemProperty -Path $C2rCfg -Name 'UpdatesEnabled' -Value 'False' -Type String
+        Set-ItemProperty -Path $C2rCfg -Name 'UpdateChannel' -Value $DevMainCdn -Type String
+        Set-ItemProperty -Path $C2rCfg -Name 'UpdateUrl' -Value $DevMainCdn -Type String
+        Set-ItemProperty -Path $C2rCfg -Name 'CDNBaseUrl' -Value $DevMainCdn -Type String   # a stale Beta 492350f6 base breaks revert (cluster provision-left C-revert)
+    }
+    OfficeUpdTaskOn | ForEach-Object { Disable-ScheduledTask -TaskName $_.TaskName -TaskPath $_.TaskPath -ErrorAction SilentlyContinue | Out-Null }
 }
 $xs = ExcelState
-Emit 'EXCEL_NOW' "$(if ($xs.ver) { $xs.ver } else { 'ABSENT' }) audience=$(if ($xs.aud) { $xs.aud } else { '-' }) updates=$(if ($xs.upd -eq 'False') { 'off' } else { "on(c2r=$($xs.c2rUpd) policy=$($xs.pol) tasks=$($xs.tasks))" })"
+Emit 'EXCEL_NOW' "$(if ($xs.ver) { $xs.ver } else { 'ABSENT' }) audience=$(if ($xs.aud) { $xs.aud } else { '-' }) updates=$(if ($xs.upd -eq 'False') { 'off' } else { "on(c2r=$($xs.c2rUpd) policy=$($xs.pol) tasks=$($xs.tasks) channel=$($xs.chan) version=$($xs.pin))" })"
 $need = ExcelNeed $xs.ver $xs.aud $xs.upd $ExcelPin
 if ($env:WS_SKIP_EXCEL -eq '1') { Emit 'EXCEL' 'skip (WS_SKIP_EXCEL=1)' }
 elseif ((ExcelBuild $ExcelPin) -eq 20301) { Emit 'EXCEL' "FAIL WS_EXCEL_PIN=$ExcelPin is 20301 (Copilot FAB crash) -- pin 20306 or later" }
 elseif ($need -eq 'none') { Emit 'EXCEL' "ok $($xs.ver) $($xs.aud), auto-update off" }
 elseif ($Apply -and -not $isAdmin) { Emit 'EXCEL' "FAIL need an elevated PowerShell to $need dogfood Excel" }
-elseif (-not $Apply) { Emit 'EXCEL' $(if ($need -eq 'install') { "WOULD install dogfood Excel $ExcelPin (Dogfood::DevMain, ODT from the DevMain CDN, ~4 GB / ~7 min) + turn Office auto-update off" } else { 'WOULD turn Office auto-update off (policy + C2R + scheduled tasks)' }) }
+elseif (-not $Apply) { Emit 'EXCEL' $(if ($need -eq 'install') { "WOULD install dogfood Excel $ExcelPin (Dogfood::DevMain, ODT from the DevMain CDN, ~4 GB / ~7 min) + turn Office auto-update off" } else { 'WOULD turn Office auto-update off (policy + version pin + C2R channel=DevMain + scheduled tasks)' }) }
 elseif ($need -eq 'updates-off') {
     Step 'EXCEL: dogfood build already there -- turning Office auto-update off'
     ExcelUpdatesOff; $xs = ExcelState
-    if ($xs.upd -eq 'False') { Emit 'EXCEL' "did turn auto-update off; ok $($xs.ver) $($xs.aud)" } else { Emit 'EXCEL' "FAIL auto-update still on (c2r=$($xs.c2rUpd) policy=$($xs.pol) tasks=$($xs.tasks))" }
+    if ($xs.upd -eq 'False') { Emit 'EXCEL' "did turn auto-update off; ok $($xs.ver) $($xs.aud)" } else { Emit 'EXCEL' "FAIL auto-update still on (c2r=$($xs.c2rUpd) policy=$($xs.pol) tasks=$($xs.tasks) channel=$($xs.chan) version=$($xs.pin)) -- a Cloud PC/Intune Office policy may be re-applying it" }
 }
 elseif (Get-Process -Name EXCEL -ErrorAction SilentlyContinue) { Emit 'EXCEL' 'REFUSE Excel is running -- save your work, close Excel, then run this bootstrap again (the dogfood install force-closes Office)' }
 else {
