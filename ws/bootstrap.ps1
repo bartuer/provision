@@ -317,6 +317,124 @@ else {
     else { Emit 'NODE' "FAIL $NodeExe absent after install (rc=$($script:rc)) -- tserver (stage 6) cannot mint the ADO token; log: $LogFile" }
 }
 
+# EXCEL: dogfood Excel (plan 01 Phase R).  wserver drives the LOCAL Excel; the OfficeAgent add-in loads only on a
+# Dogfood::DevMain build.  Target = the DevMain CDN build proven on c17/fleet (16.0.20306.20002); a NEWER DevMain
+# build already there is kept (no downgrade); 20301 is never accepted (deterministic mso40uiwin32client.dll crash on
+# the Copilot FAB, OfficeAgent KNOWN-ISSUES F24).  Auto-update off at 3 layers so the pin holds.
+$ExcelPin    = $(if ($env:WS_EXCEL_PIN) { $env:WS_EXCEL_PIN } else { '16.0.20306.20002' })
+$DevMainCdn  = 'http://officecdn.microsoft.com/pr/ea4a4090-de26-49d7-93c1-91bff9e53fc3'
+$OdtUrl      = 'https://officecdn.microsoft.com/pr/wsus/setup.exe'
+$ExcelExe    = "$env:ProgramFiles\Microsoft Office\root\Office16\EXCEL.EXE"
+$C2rCfg      = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
+$OfficePol   = 'HKLM:\SOFTWARE\Policies\Microsoft\Office\16.0\Common\OfficeUpdate'
+function ExcelBuild([string]$v) { $p = "$v" -split '\.'; if ($p.Count -ge 3 -and $p[2] -match '^\d+$') { [int]$p[2] } else { 0 } }
+function ExcelNeed([string]$ver, [string]$aud, [string]$upd, [string]$pin = '16.0.20306.20002') {
+    # -> 'none' | 'updates-off' | 'install'   (pure: unit-tested by test/bootstrap.test.sh (g))
+    $b = ExcelBuild $ver
+    if (-not $ver -or $aud -ne 'Dogfood::DevMain' -or $b -eq 20301 -or $b -lt (ExcelBuild $pin)) { return 'install' }
+    if ("$upd" -ne 'False') { return 'updates-off' }
+    return 'none'
+}
+function ExcelState {
+    $v = ''; if (Test-Path -LiteralPath $ExcelExe) { $v = (Get-Item -LiteralPath $ExcelExe).VersionInfo.ProductVersion }
+    $c = Get-ItemProperty $C2rCfg -ErrorAction SilentlyContinue
+    $tasks = @(Get-ScheduledTask -TaskName 'Office Automatic Updates*','Office Feature Updates*' -ErrorAction SilentlyContinue | Where-Object { $_.State -ne 'Disabled' })
+    $pol = (Get-ItemProperty $OfficePol -ErrorAction SilentlyContinue).enableautomaticupdates
+    # updates count as off only when ALL 3 layers are off
+    $upd = $(if ("$($c.UpdatesEnabled)" -eq 'False' -and $pol -eq 0 -and $tasks.Count -eq 0) { 'False' } else { 'True' })
+    [pscustomobject]@{ ver = $v; aud = "$($c.AudienceData)"; upd = $upd; c2rUpd = "$($c.UpdatesEnabled)"; pol = $pol; tasks = $tasks.Count }
+}
+function ExcelUpdatesOff {
+    New-Item -Path $OfficePol -Force | Out-Null
+    Set-ItemProperty -Path $OfficePol -Name 'enableautomaticupdates' -Value 0 -Type DWord
+    if (Test-Path $C2rCfg) { Set-ItemProperty -Path $C2rCfg -Name 'UpdatesEnabled' -Value 'False' -Type String }
+    Get-ScheduledTask -TaskName 'Office Automatic Updates*','Office Feature Updates*' -ErrorAction SilentlyContinue | Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+}
+$xs = ExcelState
+Emit 'EXCEL_NOW' "$(if ($xs.ver) { $xs.ver } else { 'ABSENT' }) audience=$(if ($xs.aud) { $xs.aud } else { '-' }) updates=$(if ($xs.upd -eq 'False') { 'off' } else { "on(c2r=$($xs.c2rUpd) policy=$($xs.pol) tasks=$($xs.tasks))" })"
+$need = ExcelNeed $xs.ver $xs.aud $xs.upd $ExcelPin
+if ($env:WS_SKIP_EXCEL -eq '1') { Emit 'EXCEL' 'skip (WS_SKIP_EXCEL=1)' }
+elseif ((ExcelBuild $ExcelPin) -eq 20301) { Emit 'EXCEL' "FAIL WS_EXCEL_PIN=$ExcelPin is 20301 (Copilot FAB crash) -- pin 20306 or later" }
+elseif ($need -eq 'none') { Emit 'EXCEL' "ok $($xs.ver) $($xs.aud), auto-update off" }
+elseif ($Apply -and -not $isAdmin) { Emit 'EXCEL' "FAIL need an elevated PowerShell to $need dogfood Excel" }
+elseif (-not $Apply) { Emit 'EXCEL' $(if ($need -eq 'install') { "WOULD install dogfood Excel $ExcelPin (Dogfood::DevMain, ODT from the DevMain CDN, ~4 GB / ~7 min) + turn Office auto-update off" } else { 'WOULD turn Office auto-update off (policy + C2R + scheduled tasks)' }) }
+elseif ($need -eq 'updates-off') {
+    Step 'EXCEL: dogfood build already there -- turning Office auto-update off'
+    ExcelUpdatesOff; $xs = ExcelState
+    if ($xs.upd -eq 'False') { Emit 'EXCEL' "did turn auto-update off; ok $($xs.ver) $($xs.aud)" } else { Emit 'EXCEL' "FAIL auto-update still on (c2r=$($xs.c2rUpd) policy=$($xs.pol) tasks=$($xs.tasks))" }
+}
+elseif (Get-Process -Name EXCEL -ErrorAction SilentlyContinue) { Emit 'EXCEL' 'REFUSE Excel is running -- save your work, close Excel, then run this bootstrap again (the dogfood install force-closes Office)' }
+else {
+    $ok = $true
+    try { $h = Invoke-WebRequest -UseBasicParsing -Method Head "$DevMainCdn/office/data/v64_$ExcelPin.cab"; $ok = ($h.StatusCode -eq 200) } catch { $ok = $false }
+    if (-not $ok) { Emit 'EXCEL' "FAIL DevMain CDN no longer serves $ExcelPin (it keeps ~5 builds) -- set `$env:WS_EXCEL_PIN to a current DevMain build (never 20301) and run again" }
+    else {
+        $od = 'C:\temp\ws-office'; New-Item -ItemType Directory -Path $od -Force | Out-Null
+        $setup = Join-Path $od 'setup.exe'; $xml = Join-Path $od 'dogfood-devmain.xml'
+        # ODT setup.exe: the corp \\offdog share first (devbox: readable, user 2026-10-20), else the public CDN
+        # (a WORKGROUP box cannot read the share -- cluster bin/excel-stage.sh).  Same tool either way; the BUILD
+        # comes from the DevMain CDN in the XML below, never from the share (it holds no Office\Data).
+        $share = '\\offdog\ODFServer\V2\OfficeChannelInstaller\setup.exe'
+        $got = $false
+        try { if (Test-Path -LiteralPath $share) { Step "EXCEL: Office Deployment Tool from $share"; Copy-Item -LiteralPath $share $setup -Force; $got = $true } } catch { Write-Host "  EXCEL: $share not readable ($($_.Exception.Message))" }
+        if (-not $got) {
+            Step "EXCEL: download the Office Deployment Tool ($OdtUrl)"
+            try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+            try { Invoke-WebRequest -UseBasicParsing $OdtUrl -OutFile $setup } catch { Write-Host "  EXCEL: download failed: $($_.Exception.Message)" }
+        }
+        @"
+<Configuration>
+  <Add SourcePath="$DevMainCdn" OfficeClientEdition="64" MigrateArch="TRUE" Version="$ExcelPin">
+    <Product ID="O365ProPlusRetail">
+      <Language ID="en-us"/>
+      <ExcludeApp ID="Groove"/>
+    </Product>
+  </Add>
+  <Updates Enabled="FALSE" UpdatePath="$DevMainCdn"/>
+  <Display Level="None" AcceptEULA="TRUE"/>
+  <Logging Level="Standard" Path="$od"/>
+  <Property Name="FORCEAPPSHUTDOWN" Value="TRUE"/>
+</Configuration>
+"@ | Out-File $xml -Encoding ASCII
+        if (-not (Test-Path $setup)) { Emit 'EXCEL' "FAIL could not download $OdtUrl" }
+        else {
+            # F29 (OfficeAgent runbook): the per-user add-in manifest cache survives install AND uninstall and
+            # carries the old build's add-in state -> wipe it while Office is closed.
+            foreach ($t in @("$env:LOCALAPPDATA\Microsoft\Office\16.0\Wef", "$env:LOCALAPPDATA\Microsoft\Office\16.0\WebServiceCache")) {
+                if (Test-Path $t) { Remove-Item $t -Recurse -Force -ErrorAction SilentlyContinue; Write-Host "  EXCEL: wiped $t" } }
+            Get-Process -Name 'WINWORD','POWERPNT','OUTLOOK','ONENOTE','ms-teams','OneDrive' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            # stale corp pins would drag the install back to the corp build
+            Remove-ItemProperty -Path $OfficePol -Name 'updatetoversion','updatedeadline' -ErrorAction SilentlyContinue
+            # 1st: IN PLACE.  Click-to-Run is ONE platform: /configure with the DevMain SourcePath + Version moves
+            #      every installed product (Excel, Visio, ...) to that channel + build -- no uninstall needed.
+            Step "EXCEL: setup.exe /configure -> dogfood Excel $ExcelPin IN PLACE (Dogfood::DevMain; ~4 GB from the CDN, ~7 min; Office apps are closed)"
+            Live $setup @('/configure', $xml) -What "install dogfood Excel $ExcelPin" -Timeout 3600
+            $xs = ExcelState; $how = 'in place'
+            if ((ExcelNeed $xs.ver $xs.aud 'False' $ExcelPin) -ne 'none') {
+                # 2nd: the in-place switch did not land (EXCEL.EXE / audience still the corp build) -> remove ALL
+                #      Click-to-Run products (ODT <Remove All>, silent -- not the runbook's interactive .bat), then
+                #      a clean install.  The other Office apps come back from the same O365ProPlusRetail product.
+                Write-Host "  EXCEL: in-place switch left $($xs.ver) audience=$($xs.aud) -- removing Office, then a clean install" -ForegroundColor Yellow
+                $rm = Join-Path $od 'remove-all.xml'
+                '<Configuration><Remove All="TRUE"/><Display Level="None" AcceptEULA="TRUE"/><Property Name="FORCEAPPSHUTDOWN" Value="TRUE"/></Configuration>' | Out-File $rm -Encoding ASCII
+                Step 'EXCEL: setup.exe /configure remove-all.xml (uninstall every Click-to-Run product)'
+                Live $setup @('/configure', $rm) -What 'uninstall Office (Click-to-Run)' -Timeout 1800
+                Step "EXCEL: setup.exe /configure -> dogfood Excel $ExcelPin (clean install)"
+                Live $setup @('/configure', $xml) -What "install dogfood Excel $ExcelPin" -Timeout 3600
+                $how = 'after uninstall'
+            }
+            # F19 (OfficeAgent runbook): a fresh install may not reflect VFS -> Common Files\Microsoft Shared\Office16
+            foreach ($pair in @(@("$env:ProgramFiles\Microsoft Office\root\vfs\ProgramFilesCommonX64\Microsoft Shared\Office16", "$env:ProgramFiles\Common Files\Microsoft Shared\Office16"),
+                                @("$env:ProgramFiles\Microsoft Office\root\vfs\ProgramFilesCommonX86\Microsoft Shared\Office16", "${env:ProgramFiles(x86)}\Common Files\Microsoft Shared\Office16"))) {
+                if ((Test-Path $pair[0]) -and -not (Test-Path $pair[1])) { Copy-Item -Path $pair[0] -Destination $pair[1] -Recurse -Force; Write-Host "  EXCEL: staged $($pair[1])" } }
+            ExcelUpdatesOff
+            $xs = ExcelState; $need = ExcelNeed $xs.ver $xs.aud $xs.upd $ExcelPin
+            if ($need -eq 'none') { Emit 'EXCEL' "did install dogfood Excel $($xs.ver) $($xs.aud) ($how), auto-update off -- reboot Windows before the first Excel run" }
+            else { Emit 'EXCEL' "FAIL after setup.exe (rc=$($script:rc)): $($xs.ver) audience=$($xs.aud) updates=$($xs.upd) -- logs in $od" }
+        }
+    }
+}
+
 # INIT
 $here = $(if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { '' })
 $local = $(if ($here) { Join-Path $here 'init.sh' } else { '' })
