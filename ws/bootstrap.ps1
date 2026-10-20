@@ -380,7 +380,7 @@ else {
         if (-not $got) {
             Step "EXCEL: download the Office Deployment Tool ($OdtUrl)"
             try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-            try { Invoke-WebRequest -UseBasicParsing $OdtUrl -OutFile $setup } catch { Write-Host "  EXCEL: download failed: $($_.Exception.Message)" }
+            try { $ProgressPreference = 'Continue'; Invoke-WebRequest -UseBasicParsing $OdtUrl -OutFile $setup } catch { Write-Host "  EXCEL: download failed: $($_.Exception.Message)" }
         }
         @"
 <Configuration>
@@ -391,7 +391,7 @@ else {
     </Product>
   </Add>
   <Updates Enabled="FALSE" UpdatePath="$DevMainCdn"/>
-  <Display Level="None" AcceptEULA="TRUE"/>
+  <Display Level="Full" AcceptEULA="TRUE"/>
   <Logging Level="Standard" Path="$od"/>
   <Property Name="FORCEAPPSHUTDOWN" Value="TRUE"/>
 </Configuration>
@@ -407,7 +407,7 @@ else {
             Remove-ItemProperty -Path $OfficePol -Name 'updatetoversion','updatedeadline' -ErrorAction SilentlyContinue
             # 1st: IN PLACE.  Click-to-Run is ONE platform: /configure with the DevMain SourcePath + Version moves
             #      every installed product (Excel, Visio, ...) to that channel + build -- no uninstall needed.
-            Step "EXCEL: setup.exe /configure -> dogfood Excel $ExcelPin IN PLACE (Dogfood::DevMain; ~4 GB from the CDN, ~7 min; Office apps are closed)"
+            Step "EXCEL: setup.exe /configure -> dogfood Excel $ExcelPin IN PLACE (Dogfood::DevMain; ~4 GB from the CDN, ~7 min; Office apps are closed) -- the Office installer window shows the download/install %; no clicks needed"
             Live $setup @('/configure', $xml) -What "install dogfood Excel $ExcelPin" -Timeout 3600
             $xs = ExcelState; $how = 'in place'
             if ((ExcelNeed $xs.ver $xs.aud 'False' $ExcelPin) -ne 'none') {
@@ -416,7 +416,7 @@ else {
                 #      a clean install.  The other Office apps come back from the same O365ProPlusRetail product.
                 Write-Host "  EXCEL: in-place switch left $($xs.ver) audience=$($xs.aud) -- removing Office, then a clean install" -ForegroundColor Yellow
                 $rm = Join-Path $od 'remove-all.xml'
-                '<Configuration><Remove All="TRUE"/><Display Level="None" AcceptEULA="TRUE"/><Property Name="FORCEAPPSHUTDOWN" Value="TRUE"/></Configuration>' | Out-File $rm -Encoding ASCII
+                '<Configuration><Remove All="TRUE"/><Display Level="Full" AcceptEULA="TRUE"/><Property Name="FORCEAPPSHUTDOWN" Value="TRUE"/></Configuration>' | Out-File $rm -Encoding ASCII
                 Step 'EXCEL: setup.exe /configure remove-all.xml (uninstall every Click-to-Run product)'
                 Live $setup @('/configure', $rm) -What 'uninstall Office (Click-to-Run)' -Timeout 1800
                 Step "EXCEL: setup.exe /configure -> dogfood Excel $ExcelPin (clean install)"
