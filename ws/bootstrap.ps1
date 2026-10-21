@@ -19,8 +19,8 @@
               re-run is this same bootstrap (everything is idempotent).
       WIN     after INIT ok: the Windows half, install.ps1 from the distro (WebView2 149 + pin, Excel shim,
               WEF, ASR, ssh, docker shims, VM boot task).  WS_SKIP_WIN=1 skips.
-      BENCH   after WIN: bin/bench-ctxcore.sh --fix --make-lane-on (grader, lane on) -> its --check clean.
-              WS_SKIP_BENCH=1 skips.
+      BENCH   after WIN: install.sh 10 = bin/bench-ctxcore.sh --fix --make-lane-on, then its --check clean.
+              WS_SKIP_BENCH=1 skips.  CLI (in /workspace) opens only if BENCH ok; else a WSL shell there.
     A distro restart (init.sh says RESTART_NEEDED: systemd was just enabled) is a separate gate
     done here automatically with `wsl --terminate <distro>` -- never `wsl --shutdown`.  It is refused (the
     command is printed for the user instead) when this script runs from inside WSL or when the distro has
@@ -177,14 +177,17 @@ function WinTier {
     $bad = @(@($out) | Where-Object { $_ -match '^[A-Z0-9_]+=(ABSENT|MISSING|FAIL|NO)' }) -join '; '
     if ($res -eq 'OK') { Emit 'WIN' 'ok install.ps1' } else { Emit 'WIN' "FAIL install.ps1 RESULT=$res $bad (re-run elevated: powershell -ExecutionPolicy Bypass -File $dst\install.ps1 -Distro $($script:D))" }
 }
-# BENCH: what bench-ctxcore.sh --check needs beyond install.sh -- the cihc grader at the OA pin, the lane-on
-# container (officeagent-on :6030, CtxCore flight), /workspace/W-Server.  Same --fix the user would type.
+# BENCH = install.sh 10 (plan 02 E.2): the LAST install stage -- bench-ctxcore.sh --fix --make-lane-on, then its
+# --check (cihc grader at the OA pin, lane on :6030, wserver, win-* rows WIN just fixed) + CLI trusts /workspace.
+# Runs after WIN because the win-* rows need install.ps1.  The CLI window opens only if BENCH is ok.
 function BenchReady {
-    if ($env:WS_SKIP_BENCH -eq '1') { Emit 'BENCH' 'skip (WS_SKIP_BENCH=1)'; return }
-    Step "BENCH: bin/bench-ctxcore.sh --fix --make-lane-on (grader, lane on, then --check)"
-    $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', 'cd /workspace && bin/bench-ctxcore.sh --fix --make-lane-on') -Timeout 900 -Tag 'bench'
-    $f = @(@($out) | Where-Object { $_ -match '^CHECK\s+\S+\s+FAIL' } | ForEach-Object { ($_ -split '\s+')[1] }) -join ','
-    if ($script:rc -eq 0) { Emit 'BENCH' 'ok bench-ctxcore.sh --check clean' } else { Emit 'BENCH' "FAIL bench-ctxcore.sh --check: $f (wsl -u root; cd /workspace; bin/bench-ctxcore.sh --check)" }
+    if ($env:WS_SKIP_BENCH -eq '1') { $script:benchOk = $true; Emit 'BENCH' 'skip (WS_SKIP_BENCH=1)'; return }
+    Step "BENCH: install.sh 10 (bench-ctxcore.sh --fix --make-lane-on, then --check)"
+    $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', 'cd /workspace && WS_CLI=0 ./install.sh 10') -Timeout 900 -Tag 'bench'
+    $line = @(@($out) | Where-Object { $_ -match '^STAGE=10 ' } | Select-Object -Last 1) -join ''
+    $script:benchOk = ($script:rc -eq 0)
+    if ($script:benchOk) { Emit 'BENCH' "ok $line"; return }
+    Emit 'BENCH' "FAIL $line (re-run: wsl -u root, cd /workspace, ./install.sh 10 -- detail: bin/bench-ctxcore.sh --check)"
 }
 
 function Main {
@@ -658,7 +661,7 @@ if (-not $Apply) {
     if ($distroUp) { FixWslNet; RunInit '--dry-run' }
     Emit 'INIT' "WOULD run init.sh --apply ($src) as root in $($script:D): WS_URL=$WsUrl -> /workspace + ./install.sh"
     Emit 'WIN' $(if ($env:WS_SKIP_WIN -eq '1') { 'skip (WS_SKIP_WIN=1)' } else { 'WOULD run install.ps1 from the distro (WV2 PIN SHIM WEF ASR SSH DOCKER VMBOOT)' })
-    Emit 'BENCH' $(if ($env:WS_SKIP_BENCH -eq '1') { 'skip (WS_SKIP_BENCH=1)' } else { 'WOULD run bin/bench-ctxcore.sh --fix --make-lane-on' })
+    Emit 'BENCH' $(if ($env:WS_SKIP_BENCH -eq '1') { 'skip (WS_SKIP_BENCH=1)' } else { 'WOULD run install.sh 10 (bench-ctxcore.sh --fix --make-lane-on, --check)' })
     return (Done)
 }
 if (-not $distroUp) { Emit 'INIT' "FAIL distro $($script:D) not registered"; return (Done) }
@@ -684,14 +687,19 @@ if ($r -eq 'OK') {
     BenchReady
     # Land the user in GHCP CLI inside the bench container, in its OWN window (init.sh runs install.sh with WS_CLI=0:
     # a TUI inside the init window filled /tmp/ws-init.out with binary and replaced the window).  $env:WS_CLI=0 skips.
+    # BENCH FAIL -> a plain WSL root shell in /workspace instead (fix, then ./install.sh 10 opens the CLI itself).
     if ($env:WS_CLI -ne '0') {
         $path = (Get-Command wsl.exe).Source
-        $cli = @('-d', $script:D, '-u', 'root', '-e', 'docker', 'exec', '-it', 'officeagent-dev', 'bash', '-ic', 't main || echo "GHCP CLI exited rc=$? -- staying in the container shell (t = copilot in tmux, h = pick model, ec = emacs)" && exec bash -i')
+        if ($script:benchOk) { $title = 'GHCP CLI (officeagent-dev)'
+            $cli = @('-d', $script:D, '-u', 'root', '-e', 'docker', 'exec', '-it', '-w', '/workspace', 'officeagent-dev', 'bash', '-ic', 't main || echo "GHCP CLI exited rc=$? -- staying in the container shell (t = copilot in tmux, h = pick model, ec = emacs)" && exec bash -i') }
+        else { $title = 'WSL /workspace (BENCH FAIL)'
+            $cli = @('-d', $script:D, '-u', 'root', '--cd', '/workspace', '-e', 'bash', '-c', 'echo "BENCH FAIL -- fix the rows below, then ./install.sh 10 (opens GHCP CLI)" && bin/bench-ctxcore.sh --check && exec bash -i || exec bash -i') }
         # NO ';' in $cli: wt.exe splits its command line on ';' (a 2nd tab ran 'exec' -> 'cannot find the file specified')
         $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
-        if ($wt -and $env:WS_WT -ne '0') { Start-Process -FilePath $wt.Source -ArgumentList ((@('-w', 'new', 'new-tab', '--title', 'GHCP CLI (officeagent-dev)', $path) + $cli | ForEach-Object { Q $_ }) -join ' ') }
+        if ($wt -and $env:WS_WT -ne '0') { Start-Process -FilePath $wt.Source -ArgumentList ((@('-w', 'new', 'new-tab', '--title', $title, $path) + $cli | ForEach-Object { Q $_ }) -join ' ') }
         else { Start-Process -FilePath $path -ArgumentList (($cli | ForEach-Object { Q $_ }) -join ' ') }
-        Emit 'CLI' "opened GHCP CLI in officeagent-dev (new window; tmux 'main', detach C-b d). Later: wsl, then docker exec -it officeagent-dev bash -> t / h / ec"
+        if (-not $script:benchOk) { Emit 'CLI' "NOT opened (BENCH FAIL) -- opened a WSL shell in /workspace; fix, then ./install.sh 10" }
+        else { Emit 'CLI' "opened GHCP CLI in officeagent-dev:/workspace (new window; tmux 'main', detach C-b d). Later: wsl, then docker exec -it officeagent-dev bash -> t / h / ec" }
     }
 }
 else {
