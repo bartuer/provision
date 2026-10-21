@@ -17,6 +17,10 @@
       INIT    init.sh (next to this file, else -InitUrl) run as root in the distro: dry-run -> its own dry
               run is shown as `  init: ...` lines; real run -> `init.sh --apply`.  On failure the one-liner to
               re-run is this same bootstrap (everything is idempotent).
+      WIN     after INIT ok: the Windows half, install.ps1 from the distro (WebView2 149 + pin, Excel shim,
+              WEF, ASR, ssh, docker shims, VM boot task).  WS_SKIP_WIN=1 skips.
+      BENCH   after WIN: bin/bench-ctxcore.sh --fix --make-lane-on (grader, lane on) -> its --check clean.
+              WS_SKIP_BENCH=1 skips.
     A distro restart (init.sh says RESTART_NEEDED: systemd was just enabled) is a separate gate
     done here automatically with `wsl --terminate <distro>` -- never `wsl --shutdown`.  It is refused (the
     command is printed for the user instead) when this script runs from inside WSL or when the distro has
@@ -152,6 +156,36 @@ function Distros {   # @{name=..; ver=..; default=$bool} from `wsl -l -v`
     return $r
 }
 function InDistro([string]$cmd) { return Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', $cmd) -Timeout 30 }
+
+# WIN: the Windows half of install (install.ps1: WV2 tree, PIN, SHIM, WEF, ASR, SSH, DOCKER, VMBOOT).  It needs
+# admin, which this bootstrap already is; before 2026-10-21 a new box had to run it by hand and
+# bench-ctxcore.sh --check showed win-WV2/PIN/SHIM FAIL.  install.ps1 + its bin\ helpers are copied out of the
+# distro to %TEMP% (a ps1 on \\wsl.localhost is a network path: zone/policy prompts).
+function WinTier {
+    if ($env:WS_SKIP_WIN -eq '1') { Emit 'WIN' 'skip (WS_SKIP_WIN=1)'; return }
+    $src = "\\wsl.localhost\$($script:D)\workspace"
+    if (-not (Test-Path "$src\install.ps1")) { $src = "\\wsl$\$($script:D)\workspace" }
+    if (-not (Test-Path "$src\install.ps1")) { Emit 'WIN' "FAIL no $src\install.ps1"; return }
+    $dst = Join-Path $env:TEMP 'ws-install'; Remove-Item -Recurse -Force $dst -EA SilentlyContinue
+    New-Item -ItemType Directory -Force "$dst\bin" | Out-Null
+    Copy-Item "$src\install.ps1" $dst
+    foreach ($f in 'pin-wv2-149.ps1', 'docker.cmd', 'bench.cmd') { Copy-Item "$src\bin\$f" "$dst\bin\" -EA SilentlyContinue }
+    Step "WIN: install.ps1 (WebView2 149 tree + pin, Excel shim, WEF, ASR, ssh, docker shims, VM boot task)"
+    $ps = (Get-Command powershell.exe).Source
+    $out = Native $ps @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$dst\install.ps1", '-Distro', $script:D, '-Repo', '/workspace') -Timeout 900 -Tag 'install.ps1'
+    $res = (@($out) | Where-Object { $_ -match '^RESULT=' } | Select-Object -Last 1) -replace '^RESULT=', ''
+    $bad = @(@($out) | Where-Object { $_ -match '^[A-Z0-9_]+=(ABSENT|MISSING|FAIL|NO)' }) -join '; '
+    if ($res -eq 'OK') { Emit 'WIN' 'ok install.ps1' } else { Emit 'WIN' "FAIL install.ps1 RESULT=$res $bad (re-run elevated: powershell -ExecutionPolicy Bypass -File $dst\install.ps1 -Distro $($script:D))" }
+}
+# BENCH: what bench-ctxcore.sh --check needs beyond install.sh -- the cihc grader at the OA pin, the lane-on
+# container (officeagent-on :6030, CtxCore flight), /workspace/W-Server.  Same --fix the user would type.
+function BenchReady {
+    if ($env:WS_SKIP_BENCH -eq '1') { Emit 'BENCH' 'skip (WS_SKIP_BENCH=1)'; return }
+    Step "BENCH: bin/bench-ctxcore.sh --fix --make-lane-on (grader, lane on, then --check)"
+    $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', 'cd /workspace && bin/bench-ctxcore.sh --fix --make-lane-on') -Timeout 900 -Tag 'bench'
+    $f = @(@($out) | Where-Object { $_ -match '^CHECK\s+\S+\s+FAIL' } | ForEach-Object { ($_ -split '\s+')[1] }) -join ','
+    if ($script:rc -eq 0) { Emit 'BENCH' 'ok bench-ctxcore.sh --check clean' } else { Emit 'BENCH' "FAIL bench-ctxcore.sh --check: $f (wsl -u root; cd /workspace; bin/bench-ctxcore.sh --check)" }
+}
 
 function Main {
 Write-Output "MODE=$(if ($Apply) { 'apply' } else { 'dry-run' })"
@@ -623,6 +657,8 @@ $distroUp = [bool](Distros | Where-Object { $_.name -eq $script:D })
 if (-not $Apply) {
     if ($distroUp) { FixWslNet; RunInit '--dry-run' }
     Emit 'INIT' "WOULD run init.sh --apply ($src) as root in $($script:D): WS_URL=$WsUrl -> /workspace + ./install.sh"
+    Emit 'WIN' $(if ($env:WS_SKIP_WIN -eq '1') { 'skip (WS_SKIP_WIN=1)' } else { 'WOULD run install.ps1 from the distro (WV2 PIN SHIM WEF ASR SSH DOCKER VMBOOT)' })
+    Emit 'BENCH' $(if ($env:WS_SKIP_BENCH -eq '1') { 'skip (WS_SKIP_BENCH=1)' } else { 'WOULD run bin/bench-ctxcore.sh --fix --make-lane-on' })
     return (Done)
 }
 if (-not $distroUp) { Emit 'INIT' "FAIL distro $($script:D) not registered"; return (Done) }
@@ -644,6 +680,8 @@ Emit 'GCMPATH' "win=$(if ($GcmWin) { $GcmWin } else { 'NOT FOUND' }) git=$GitWin
 Emit 'NODEPATH' "win=$(if ($NodeWin) { $NodeWin } else { 'NOT FOUND' })"
 if ($r -eq 'OK') {
     Emit 'INIT' "ok init.sh --apply in $($script:D)"
+    WinTier
+    BenchReady
     # Land the user in GHCP CLI inside the bench container, in its OWN window (init.sh runs install.sh with WS_CLI=0:
     # a TUI inside the init window filled /tmp/ws-init.out with binary and replaced the window).  $env:WS_CLI=0 skips.
     if ($env:WS_CLI -ne '0') {
