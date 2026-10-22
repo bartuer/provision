@@ -5,7 +5,7 @@
     what it would do.
 
 .DESCRIPTION
-    Each step prints KEY=ok|WOULD <action>|FAIL <why>; the last line is RESULT=OK|PLAN|FAIL|REBOOT_NEEDED|
+    Each step prints KEY=ok|WOULD <action>|FAIL <why>; the last line is RESULT=OK|PLAN|FAIL|PENDING|REBOOT_NEEDED|
     RESTART_NEEDED|REFUSED.
       ADMIN   elevated?  (a real run needs it for WSL / DISTRO installs)
       WSL     Ubuntu-26.04 on WSL2: absent -> `wsl --install -d Ubuntu-26.04 --no-launch` (engine + distro in one
@@ -187,6 +187,7 @@ function BenchReady {
     $line = @(@($out) | Where-Object { $_ -match '^STAGE=10 ' } | Select-Object -Last 1) -join ''
     $script:benchOk = ($script:rc -eq 0)
     if ($script:benchOk) { Emit 'BENCH' "ok $line"; return }
+    if ($script:rc -eq 1460) { Emit 'BENCH' "PENDING watch timed out after 900s, install.sh 10 may still run in WSL (check: wsl -u root, cd /workspace, ./install.sh --check 10)"; return }
     Emit 'BENCH' "FAIL $line (re-run: wsl -u root, cd /workspace, ./install.sh 10 -- detail: bin/bench-ctxcore.sh --check)"
 }
 
@@ -547,6 +548,31 @@ $DnsWin = ''
 try { $DnsWin = ((Get-DnsClientServerAddress -AddressFamily IPv4 -EA Stop | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' -and $_ -notmatch '^(127|169\.254)\.' } | Select-Object -Unique) -join ' ') } catch {}
 Write-Host "  node.exe: $(if ($NodeWin) { "$NodeWin ($((& $NodeWin --version 2>$null) -join ''))" } else { 'NOT FOUND (tserver stage 6 will give no token)' })" -ForegroundColor $(if ($NodeWin) { 'Green' } else { 'Red' })
 if ($GcmWin) { Write-Host "  gcm     : $GcmWin" -ForegroundColor Green } else { Write-Host "  gcm     : NOT FOUND (see the 'tried' list above)" -ForegroundColor Red }
+# init.sh job state, ONE line: done:<rc> | running:<pid> | gone.  Anything else is a failed probe (wsl.exe prints
+# its own errors on stdout) and is never read as done (plan 05: a failed probe ended the watch as "rc=1").
+$InitProbe = 'if [ -s /tmp/ws-init.rc ]; then echo done:$(tr -dc 0-9 < /tmp/ws-init.rc); elif [ -s /tmp/ws-init.pid ] && kill -0 $(cat /tmp/ws-init.pid) 2>/dev/null; then echo running:$(cat /tmp/ws-init.pid); else echo gone; fi'   # no double quotes: PS 5.1 does not escape them on a native argv
+function WatchInit($probe, $tail, $p, [int]$Budget = 7200, [double]$Sleep = 5, [int]$Stall = 900, [int]$GoneMax = 24) {
+    # -> @{state=DONE|FAILED|LOST|TIMEOUT; rc}.  Only DONE/FAILED come from init.sh; a closed console is only logged.
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $gone = 0; $last = ''; $lastT = 0; $warned = $false; $cexit = $false; $stage = ''
+    while ($true) {
+        $s = "$(& $probe)".Trim()
+        if ($s -match '^done:(\d+)$') { $rc = [int]$Matches[1]; Write-Host "  init: probe $s"; return @{ state = $(if ($rc) { 'FAILED' } else { 'DONE' }); rc = $rc } }
+        if ($s -match '^running:\d+$') { $gone = 0 }
+        elseif ($s -eq 'gone') { $gone++; if ($gone -ge $GoneMax) { Write-Host "  init: probe gone x$gone (no rc file, no live job)"; return @{ state = 'LOST'; rc = $null } } }
+        else { Write-Host ("  init: probe error at {0}s (not done, retrying): {1}" -f [int]$sw.Elapsed.TotalSeconds, ($s -replace "`0", '')) }
+        if ($p -and -not $cexit -and $p.HasExited) { $cexit = $true; Write-Host "  init: client-exit (console window closed rc=$($p.ExitCode)) -- still watching the WSL job" }
+        $t = [int]$sw.Elapsed.TotalSeconds
+        if ($t -gt $Budget) { Write-Host "  init: TIMEOUT after ${Budget}s"; return @{ state = 'TIMEOUT'; rc = $null } }
+        $tl = @(& $tail | ForEach-Object { ("$_" -replace "`0", '').Trim() } | Where-Object { $_ })
+        foreach ($l in $tl) { if ($l -match '^STAGE=(\d+ \S+)') { $stage = $Matches[1] } }
+        $cur = $(if ($tl.Count) { $tl[-1] } else { '' }); if ($cur.Length -gt 100) { $cur = $cur.Substring(0, 100) }
+        if ($cur -ne $last) { $last = $cur; $lastT = $t; $warned = $false }
+        elseif (-not $warned -and $t - $lastT -ge $Stall) { $warned = $true; Write-Host "  init: WARN no new output for $($t - $lastT)s (still watching): $cur" }
+        $act = $(if ($stage) { "init.sh after STAGE=$stage" } else { 'init.sh --apply (in the Ubuntu window)' })
+        Write-Progress -Id 7 -Activity $act -Status ("{0}m{1:d2}s  {2}  {3}" -f [int][math]::Floor($t / 60), ($t % 60), $(if ($s -match '^running') { 'running' } else { 'waiting' }), $cur) -PercentComplete -1
+        Start-Sleep -Milliseconds ([int](1000 * $Sleep))
+    }
+}
 function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding mangling), stdin left to the console
     $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($init -replace "`r`n", "`n")))
     # init.sh goes over STDIN: its base64 (~33 KB) on the command line exceeds the 32767-char Windows limit
@@ -558,7 +584,7 @@ function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding man
         # so apt / git clone / lfs draw their native progress and a credential prompt can be answered there.
         # `script` keeps the pty AND logs to /tmp/ws-init.out; this window shows a progress bar + the last log line.
         $ErrorActionPreference = $old
-        $run = "rm -f /tmp/ws-init.out; " +
+        $run = "echo `$`$ > /tmp/ws-init.pid; [ -f /tmp/ws-init.out ] && mv -f /tmp/ws-init.out /tmp/ws-init.`$(date -u +%Y%m%dT%H%M%SZ -r /tmp/ws-init.out).out; " +
                "export INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_DNS_WIN='$DnsWin' INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
                "else WS_URL='$WsUrl' bash /tmp/ws-init.sh --apply 2>&1 | tee /tmp/ws-init.out; fi; rc=`$?; rm -f /tmp/ws-init.sh; echo `$rc > /tmp/ws-init.rc; " +
                "if [ `$rc != 0 ]; then echo; echo 'init.sh FAILED (rc='`$rc') -- see the FAIL line above; press Enter to close'; read x; fi; exit `$rc"
@@ -567,8 +593,13 @@ function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding man
         # Windows Terminal when present (readable font; user ruling 2026-10-19).  $env:WS_WT=0 forces the classic wsl.exe console.
         # The command goes to a file first: wt treats ';' as its own separator, so it must not see $run.
         $rb64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($run))
-        $null = ($rb64 | & wsl.exe -d $script:D -u root -e sh -c "rm -f /tmp/ws-init.rc; tr -d '\r\n' | base64 -d > /tmp/ws-run.sh" 2>&1)
+        $probe = { "$(& wsl.exe -d $script:D -u root -e sh -c $InitProbe 2>&1)" }
+        $p = $null; $s0 = & $probe
+        if ($s0 -match '^running:\d+$') { Write-Host "  init: re-attach: an init.sh job is already running ($s0) -- watching it, not starting a second one" }
+        else {
+        $null = ($rb64 | & wsl.exe -d $script:D -u root -e sh -c "rm -f /tmp/ws-init.rc /tmp/ws-init.pid; tr -d '\r\n' | base64 -d > /tmp/ws-run.sh" 2>&1)
         $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
+        Write-Host "  init: window=$(if ($wt -and $env:WS_WT -ne '0') { 'wt' } else { 'classic' })"
         if ($wt -and $env:WS_WT -ne '0') {
             Start-Process -FilePath $wt.Source -ArgumentList ((@('-w', 'new', 'new-tab', '--title', 'workspace init', $path, '-d', $script:D, '-u', 'root', '-e', 'bash', '/tmp/ws-run.sh') | ForEach-Object { Q $_ }) -join ' ')
             $p = $null
@@ -576,30 +607,26 @@ function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding man
             $p = Start-Process -FilePath $path -ArgumentList ((@('-d', $script:D, '-u', 'root', '-e', 'bash', '/tmp/ws-run.sh') | ForEach-Object { Q $_ }) -join ' ') -PassThru
             $null = $p.Handle
         }
-        # done = the rc file exists (wt.exe hands off to the terminal and exits at once, so its process says nothing)
-        $doneF = { [bool](& wsl.exe -d $script:D -u root -e sh -c "test -s /tmp/ws-init.rc && echo y" 2>$null) }
-        $sw = [Diagnostics.Stopwatch]::StartNew(); $tail = ''
-        while (-not (& $doneF)) {
-            if ($p -and $p.HasExited -and -not (& $doneF)) { break }   # console window closed before init.sh finished
-            Start-Sleep -Seconds 5
-            $t = [int]$sw.Elapsed.TotalSeconds
-            $tl = & wsl.exe -d $script:D -u root -e sh -c "tail -c 4000 /tmp/ws-init.out 2>/dev/null | tr '\r' '\n' | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | grep -v '^[[:space:]]*$' | tail -n 1" 2>$null
-            if ($tl) { $tail = ("$tl" -replace "`0", '').Trim() }
-            if ($tail.Length -gt 100) { $tail = $tail.Substring(0, 100) }
-            Write-Progress -Activity 'init.sh --apply (in the Ubuntu window)' -Status ("{0}m{1:d2}s  {2}" -f [int][math]::Floor($t / 60), ($t % 60), $tail) -PercentComplete -1
-            if ($t -gt 7200) { if ($p) { try { $p.Kill() } catch {} }; Write-Host '  init: TIMEOUT after 2h -- stopped watching'; break }
         }
-        Write-Progress -Activity 'init.sh --apply (in the Ubuntu window)' -Completed
-        $rcs = & wsl.exe -d $script:D -u root -e sh -c "cat /tmp/ws-init.rc 2>/dev/null" 2>$null
-        $script:rc = if ("$rcs".Trim() -match '^\d+$') { [int]"$rcs".Trim() } else { 1 }
+        $tailF = { & wsl.exe -d $script:D -u root -e sh -c "tail -c 200000 /tmp/ws-init.out 2>/dev/null | tr '\r' '\n' | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | grep -av '^[[:space:]]*$' | { grep -a '^STAGE=' | tail -n 1; } ; tail -c 4000 /tmp/ws-init.out 2>/dev/null | tr '\r' '\n' | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | grep -av '^[[:space:]]*$' | tail -n 1" 2>$null }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $w = WatchInit $probe $tailF $p
+        Write-Progress -Id 7 -Activity 'init.sh' -Completed
+        $script:initState = $w.state
+        $script:rc = $(if ($w.state -in @('DONE', 'FAILED')) { $w.rc } else { 1 })
         $script:initOut = @(& wsl.exe -d $script:D -u root -e sh -c "tr '\r' '\n' < /tmp/ws-init.out 2>/dev/null | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | grep -aE '^[A-Z_]+='" 2>$null | ForEach-Object { ("$_" -replace "`0", '').Trim() } | Where-Object { $_ })
         foreach ($l in $script:initOut) { Write-Host "  init: $l" }
-        Write-Host ("  init: rc={0} in {1}s  (full log in the distro: /tmp/ws-init.out)" -f $script:rc, [int]$sw.Elapsed.TotalSeconds)
+        Write-Host ("  init: {0} rc={1} in {2}s  (full log in the distro: /tmp/ws-init.out)" -f $w.state, $script:rc, [int]$sw.Elapsed.TotalSeconds)
         return
     }
     Step "INIT: init.sh $mode as root in $($script:D) (live output below)"
     $script:initOut = @(& wsl.exe -d $script:D -u root -e bash -c $cmd 2>&1 | ForEach-Object { $l = "$_"; Write-Host "  init: $l"; $l }); $script:rc = $LASTEXITCODE
     $ErrorActionPreference = $old
+}
+function InitPending {   # the watch ended without the job's rc: say so, never call it an init.sh failure
+    if ($script:initState -notin @('LOST', 'TIMEOUT')) { return $false }
+    Emit 'INIT' "PENDING watch ended ($($script:initState)) without init.sh's result -- the WSL job may still run (log: wsl -d $($script:D) -u root tail /tmp/ws-init.out); re-run this bootstrap to re-attach"
+    return $true
 }
 if (-not $init) { Emit 'INIT' "FAIL could not download init.sh from $url -- check the network, then run this bootstrap again"; return (Done) }
 # WSLNET -- a devbox runs WSL in NAT (the WSL default).  MEASURED 2026-10-19 on a Global Secure Access devbox:
@@ -668,6 +695,7 @@ if (-not $distroUp) { Emit 'INIT' "FAIL distro $($script:D) not registered"; ret
 FixWslNet
 if (-not $script:netOk) { return (Done) }
 RunInit '--apply'
+if (InitPending) { return (Done 'PENDING') }
 $r = ($script:initOut | Where-Object { $_ -match '^RESULT=' } | Select-Object -Last 1) -replace '^RESULT=', ''
 if ($r -eq 'RESTART_NEEDED') {
     $restartCmd = "wsl --terminate $($script:D)"
@@ -677,6 +705,7 @@ if ($r -eq 'RESTART_NEEDED') {
     Native 'wsl.exe' @('--terminate', $script:D) | Out-Null
     Emit 'RESTART' "did $restartCmd"
     RunInit '--apply'
+    if (InitPending) { return (Done 'PENDING') }
     $r = ($script:initOut | Where-Object { $_ -match '^RESULT=' } | Select-Object -Last 1) -replace '^RESULT=', ''
 }
 Emit 'GCMPATH' "win=$(if ($GcmWin) { $GcmWin } else { 'NOT FOUND' }) git=$GitWin"
