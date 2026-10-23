@@ -12,8 +12,9 @@
               step, live progress; no reboot)
       GIT     git.exe; absent -> Git for Windows from its GitHub release (winget only as fallback)
       GCM     `git credential-manager --version`; absent -> comes with Git, else the GCM GitHub release
-      NODE    Windows node.exe (tserver mints the ADO token via WAM under Windows node); absent -> nodejs.org
-              v18.20.6 MSI (pinned = c17), silent msiexec into C:\Program Files\nodejs
+      NODE    Windows node.exe >= v24 (tserver mints the ADO token via WAM under Windows node); absent OR older
+              (v18 = EOL, removed by corp IT 'MDEE-NodeJSEOL' cleanup) -> nodejs.org v24.22.1 LTS MSI, silent
+              msiexec into C:\Program Files\nodejs (an MSI major upgrade replaces the old one in place)
       INIT    init.sh (next to this file, else -InitUrl) run as root in the distro: dry-run -> its own dry
               run is shown as `  init: ...` lines; real run -> `init.sh --apply`.  On failure the one-liner to
               re-run is this same bootstrap (everything is idempotent).
@@ -334,13 +335,21 @@ else {
 
 # NODE: Windows node.exe -- tserver (install.sh stage 6) mints the ADO token by running the WAM broker under
 # WINDOWS node (/mnt/c/Program Files/nodejs/node.exe; the MSAL runtime is a Windows DLL).  A fresh devbox
-# has none -> stage 6 "gave no token".  Pinned to the HOST version proven on c17 (v18.20.6), MSI from nodejs.org, silent msiexec, fixed dir.
-$NodePin = 'https://nodejs.org/dist/v18.20.6/node-v18.20.6-x64.msi'
+# has none -> stage 6 "gave no token".  MEASURED 2026-10-23: corp IT ("MDEE-NodeJSEOL", SYSTEM, silent
+# msiexec REMOVE=ALL) uninstalls out-of-support Node (v18) from fleet boxes and laptops -- a v18 that is
+# present at bootstrap time is gone by stage 6 / the next day.  So: require major >= $NodeMin, pin a current
+# LTS (= the version the fleet was repaired to), and upgrade an older one in place (MSI major upgrade).
+$NodeMin = 24
+$NodePin = 'https://nodejs.org/dist/v24.22.1/node-v24.22.1-x64.msi'
 $NodeExe = "$env:ProgramFiles\nodejs\node.exe"
-function HaveNode { Test-Path -LiteralPath $NodeExe }
-if (HaveNode) { Emit 'NODE' "ok $NodeExe ($((& $NodeExe --version 2>$null) -join ''))" }
-elseif (-not $Apply) { Emit 'NODE' "WOULD install Node.js 18.20.6 (pinned = c17's Windows node) MSI into $env:ProgramFiles\nodejs" }
+function NodeVer { if (Test-Path -LiteralPath $NodeExe) { "$((& $NodeExe --version 2>$null) -join '')".Trim() } else { '' } }
+function NodeMajor { if ((NodeVer) -match '^v(\d+)\.') { [int]$Matches[1] } else { 0 } }
+function HaveNode { (NodeMajor) -ge $NodeMin }
+$nv0 = NodeVer
+if (HaveNode) { Emit 'NODE' "ok $NodeExe ($nv0)" }
+elseif (-not $Apply) { Emit 'NODE' "WOULD $(if ($nv0) { "upgrade $nv0 (EOL; corp IT cleanup removes it)" } else { 'install' }) -> Node.js $((($NodePin -split '/')[-2])) LTS MSI into $env:ProgramFiles\nodejs" }
 else {
+    if ($nv0) { Write-Host "  NODE: $NodeExe is $nv0 (< v$NodeMin, EOL: corp IT cleanup uninstalls it) -- upgrading" }
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
     $msi = Join-Path $env:TEMP ($NodePin -split '/')[-1]
     Step "NODE: download $(($NodePin -split '/')[-1])"
@@ -351,8 +360,8 @@ else {
         Live 'msiexec.exe' @('/i', $msi, '/qn', '/norestart') -What 'install node.js msi' -Timeout 900
         Remove-Item $msi -ErrorAction SilentlyContinue }
     if (-not (HaveNode)) { WingetInstall 'OpenJS.NodeJS.LTS' 'NODE' }
-    if (HaveNode) { Emit 'NODE' "did install Node.js: $NodeExe ($((& $NodeExe --version 2>$null) -join ''))" }
-    else { Emit 'NODE' "FAIL $NodeExe absent after install (rc=$($script:rc)) -- tserver (stage 6) cannot mint the ADO token; log: $LogFile" }
+    if (HaveNode) { Emit 'NODE' "did $(if ($nv0) { "upgrade $nv0 ->" } else { 'install' }) Node.js: $NodeExe ($(NodeVer))" }
+    else { Emit 'NODE' "FAIL $NodeExe $(if (NodeVer) { "is $(NodeVer) (< v$NodeMin)" } else { 'absent' }) after install (rc=$($script:rc)) -- tserver (stage 6) cannot mint the ADO token; log: $LogFile" }
 }
 
 # EXCEL: dogfood Excel (plan 01 Phase R).  wserver drives the LOCAL Excel; the OfficeAgent add-in loads only on a
