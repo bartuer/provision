@@ -561,8 +561,8 @@ if ($GcmWin) { Write-Host "  gcm     : $GcmWin" -ForegroundColor Green } else { 
 # its own errors on stdout) and is never read as done (plan 05: a failed probe ended the watch as "rc=1").
 $InitProbe = 'if [ -s /tmp/ws-init.rc ]; then echo done:$(tr -dc 0-9 < /tmp/ws-init.rc); elif [ -s /tmp/ws-init.pid ] && kill -0 $(cat /tmp/ws-init.pid) 2>/dev/null; then echo running:$(cat /tmp/ws-init.pid); else echo gone; fi'   # no double quotes: PS 5.1 does not escape them on a native argv
 function WatchInit($probe, $tail, $p, [int]$Budget = 7200, [double]$Sleep = 5, [int]$Stall = 900, [int]$GoneMax = 24) {
-    # -> @{state=DONE|FAILED|LOST|TIMEOUT; rc}.  Only DONE/FAILED come from init.sh; a closed console is only logged.
-    $sw = [Diagnostics.Stopwatch]::StartNew(); $gone = 0; $last = ''; $lastT = 0; $warned = $false; $cexit = $false; $stage = ''
+    # -> @{state=DONE|FAILED|LOST|TIMEOUT; rc}.  TIMEOUT = budget spent AND output stalled $Stall s.  Only DONE/FAILED come from init.sh; a closed console is only logged.
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $gone = 0; $last = ''; $lastT = 0; $warned = $false; $cexit = $false; $stage = ''; $over = $false
     while ($true) {
         $s = "$(& $probe)".Trim()
         if ($s -match '^done:(\d+)$') { $rc = [int]$Matches[1]; Write-Host "  init: probe $s"; return @{ state = $(if ($rc) { 'FAILED' } else { 'DONE' }); rc = $rc } }
@@ -571,12 +571,17 @@ function WatchInit($probe, $tail, $p, [int]$Budget = 7200, [double]$Sleep = 5, [
         else { Write-Host ("  init: probe error at {0}s (not done, retrying): {1}" -f [int]$sw.Elapsed.TotalSeconds, ($s -replace "`0", '')) }
         if ($p -and -not $cexit -and $p.HasExited) { $cexit = $true; Write-Host "  init: client-exit (console window closed rc=$($p.ExitCode)) -- still watching the WSL job" }
         $t = [int]$sw.Elapsed.TotalSeconds
-        if ($t -gt $Budget) { Write-Host "  init: TIMEOUT after ${Budget}s"; return @{ state = 'TIMEOUT'; rc = $null } }
         $tl = @(& $tail | ForEach-Object { ("$_" -replace "`0", '').Trim() } | Where-Object { $_ })
         foreach ($l in $tl) { if ($l -match '^STAGE=(\d+ \S+)') { $stage = $Matches[1] } }
         $cur = $(if ($tl.Count) { $tl[-1] } else { '' }); if ($cur.Length -gt 100) { $cur = $cur.Substring(0, 100) }
         if ($cur -ne $last) { $last = $cur; $lastT = $t; $warned = $false }
         elseif (-not $warned -and $t - $lastT -ge $Stall) { $warned = $true; Write-Host "  init: WARN no new output for $($t - $lastT)s (still watching): $cur" }
+        # plan 05 D.2: the budget is NOT a wall clock.  A live job whose log still moves (stage 9 pulls a 4.2 GB
+        # image) is kept; TIMEOUT only when the budget is spent AND nothing new was printed for $Stall s.
+        if ($t -gt $Budget) {
+            if ($t - $lastT -ge $Stall) { Write-Host "  init: TIMEOUT after ${t}s (budget ${Budget}s, no new output for $($t - $lastT)s): $cur"; return @{ state = 'TIMEOUT'; rc = $null } }
+            if (-not $over) { $over = $true; Write-Host "  init: budget ${Budget}s passed, output still moving -- still watching" }
+        }
         $act = $(if ($stage) { "init.sh after STAGE=$stage" } else { 'init.sh --apply (in the Ubuntu window)' })
         Write-Progress -Id 7 -Activity $act -Status ("{0}m{1:d2}s  {2}  {3}" -f [int][math]::Floor($t / 60), ($t % 60), $(if ($s -match '^running') { 'running' } else { 'waiting' }), $cur) -PercentComplete -1
         Start-Sleep -Milliseconds ([int](1000 * $Sleep))
