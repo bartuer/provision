@@ -442,7 +442,19 @@ oa_early() {
 }
 oa_wrap() { oa_early && oa_pull_bg; "$@"; local r=$?; oa_early || [ $r != 0 ] || oa_pull_bg; return $r; }   # resume paths too
 oa_pull_bg() { [ "${INIT_SKIP_LFS:-0}" = 1 ] || (cd "$WS_DIR" && ./install.sh --pull-base) 2>/dev/null | grep '^OA base pull:'; }
-sub_missing() { [ "${INIT_SKIP_SUBMODULES:-0}" != 1 ] && git -C "$WS_DIR" submodule status $(sub_paths) 2>/dev/null | grep -q '^-'; }
+# sub_missing = a submodule to (re)check out: "-" never initialized, or "+" checked out at a commit other than the
+# superproject's gitlink AND its tree is clean (laptop 2026-10-26: update_do fast-forwarded the superproject to
+# ssg_agent c32dc63, the old checkout stayed at c98ae2b -> bench-ready L3 FAIL).  A dirty "+" is left alone (WARN).
+sub_missing() {
+  [ "${INIT_SKIP_SUBMODULES:-0}" != 1 ] || return 1
+  local st p; st="$(git -C "$WS_DIR" submodule status $(sub_paths) 2>/dev/null)"
+  grep -q '^-' <<<"$st" && return 0
+  for p in $(awk '/^\+/ {print $2}' <<<"$st"); do
+    [ -z "$(git -C "$WS_DIR/$p" status --porcelain --untracked-files=no 2>/dev/null)" ] && return 0
+    echo "SUBMODULE: WARN $p has local edits and differs from its gitlink -- left alone" >&2
+  done
+  return 1
+}
 SUB_WHAT="$([ "${INIT_SUBMODULES:-0}" = 1 ] && echo "git submodule update $SUB_ARGS" || echo "git submodule update $SUB_ARGS ssg_agent")"
 # UPDATE: an existing clone is fast-forwarded to origin first -- otherwise a re-run resumes the LFS objects of an
 # OLD commit (measured 2026-10-19: a devbox clone from before 48b3021 downloaded the retired alserver.tar.gz.XX
