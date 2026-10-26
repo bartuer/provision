@@ -173,7 +173,13 @@ function WinTier {
     foreach ($f in 'pin-wv2-149.ps1', 'docker.cmd', 'bench.cmd') { Copy-Item "$src\bin\$f" "$dst\bin\" -EA SilentlyContinue }
     Step "WIN: install.ps1 (WebView2 149 tree + pin, Excel shim, WEF, ASR, ssh, docker shims, VM boot task)"
     $ps = (Get-Command powershell.exe).Source
-    $out = Native $ps @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$dst\install.ps1", '-Distro', $script:D, '-Repo', '/workspace') -Timeout 900 -Tag 'install.ps1'
+    # pwsh 7 host: Process.Start hands 5.1 pwsh's PSModulePath -> Set-Acl CouldNotAutoloadMatchingModule (cloud PC
+    # 2026-10-26).  Give the 5.1 child the machine+user module path for the call.
+    $savedPMP = $env:PSModulePath
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        $env:PSModulePath = (@([Environment]::GetEnvironmentVariable('PSModulePath', 'User'), [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')) | Where-Object { $_ }) -join ';' }
+    try { $out = Native $ps @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$dst\install.ps1", '-Distro', $script:D, '-Repo', '/workspace') -Timeout 900 -Tag 'install.ps1' }
+    finally { $env:PSModulePath = $savedPMP }
     $res = (@($out) | Where-Object { $_ -match '^RESULT=' } | Select-Object -Last 1) -replace '^RESULT=', ''
     $bad = @(@($out) | Where-Object { $_ -match '^[A-Z0-9_]+=(ABSENT|MISSING|FAIL|NO)' }) -join '; '
     if ($res -eq 'OK') { Emit 'WIN' 'ok install.ps1' } else { Emit 'WIN' "FAIL install.ps1 RESULT=$res $bad (re-run elevated: powershell -ExecutionPolicy Bypass -File $dst\install.ps1 -Distro $($script:D))" }
