@@ -24,6 +24,9 @@
               WS_SKIP_BENCH=1 skips.  CLI (in /workspace) opens only if BENCH ok; else a WSL shell there.
       SMOKE   after CLI (BENCH ok): bin/smoke-addup.sh = one ssg turn via wserver -- new sheet Numbers 1..10,
               A11 = SUM = 55; the Excel window stays open.  WS_SMOKE=0 skips.
+      REPORT  last, success or failure: bin/install-report.sh = install result, errors, stage times, network
+              (LFS + image pull MB/s), auth (GCM, tserver, kiss-auth), SMOKE -> redacted, committed under
+              fix.archive/install-reports/<host>-<UTC>/ and pushed.  WS_REPORT=0 skips.  Never fails the run.
     A distro restart (init.sh says RESTART_NEEDED: systemd was just enabled) is a separate gate
     done here automatically with `wsl --terminate <distro>` -- never `wsl --shutdown`.  It is refused (the
     command is printed for the user instead) when this script runs from inside WSL or when the distro has
@@ -735,6 +738,7 @@ if (-not $Apply) {
     Emit 'INIT' "WOULD run init.sh --apply ($src) as root in $($script:D): WS_URL=$WsUrl -> /workspace + ./install.sh"
     Emit 'WIN' $(if ($env:WS_SKIP_WIN -eq '1') { 'skip (WS_SKIP_WIN=1)' } else { 'WOULD run install.ps1 from the distro (WV2 PIN SHIM WEF ASR SSH DOCKER VMBOOT)' })
     Emit 'BENCH' $(if ($env:WS_SKIP_BENCH -eq '1') { 'skip (WS_SKIP_BENCH=1)' } else { 'WOULD run install.sh 10 (bench-ctxcore.sh --fix --make-lane-on, --check)' })
+    Write-Output $(if ($env:WS_REPORT -eq '0') { 'REPORT=skip (WS_REPORT=0)' } else { 'REPORT=WOULD run bin/install-report.sh (collect, redact, commit, push the install evidence)' })
     Emit 'SMOKE' $(if ($env:WS_SMOKE -eq '0' -or $env:WS_SKIP_BENCH -eq '1') { 'skip (WS_SMOKE=0)' } else { 'WOULD run bin/smoke-addup.sh after the CLI opens (Excel add-up, window kept open)' })
     return (Done)
 }
@@ -785,6 +789,7 @@ if ($r -eq 'OK') {
         $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', 'cd /workspace && bin/smoke-addup.sh') -Timeout 600 -Tag 'smoke'
         $line = (@(@($out) | Where-Object { $_ -match '^SMOKE ' } | Select-Object -Last 1) -join '') -replace '^SMOKE ', ''
         if (-not $line) { $line = "FAIL no SMOKE line rc=$($script:rc)" }
+        $script:smokeLine = "SMOKE $line"
         if ($line -like 'ok*') { Emit 'SMOKE' $line } else { Emit 'SMOKE' "$line (re-run: wsl -u root, cd /workspace, bin/smoke-addup.sh)" }
     }
 }
@@ -792,6 +797,22 @@ else {
     $why = @($script:initOut | Where-Object { $_ -match '=FAIL' }) -join '; '
     if (-not $why) { $why = "RESULT=$r rc=$($script:rc)" }
     Emit 'INIT' "FAIL $why -- fix that, then re-run this bootstrap (init.sh is idempotent: it does the git clone itself and skips what is done; log: wsl -d $($script:D) -u root cat /tmp/ws-init.out)"
+}
+# REPORT: bin/install-report.sh collects this install (result, errors, stage times, LFS/pull bandwidth, GCM/tserver/
+# kiss-auth, SMOKE), redacts it, commits it to fix.archive/install-reports/<host>-<UTC>/ and pushes -- success
+# AND failure, so every install reaches us.  Needs /workspace cloned (INIT got that far).  WS_REPORT=0 skips.
+if ($env:WS_REPORT -ne '0') {
+    $has = @(InDistro 'test -x /workspace/bin/install-report.sh && echo yes') -contains 'yes'
+    if ($has) {
+        Step "REPORT: bin/install-report.sh (collect + redact + commit + push the install evidence)"
+        $q = { param($x) "'" + ("$x" -replace "'", "'\''") + "'" }
+        $rcmd = "cd /workspace && bin/install-report.sh --bootstrap $(& $q "INIT=$r BENCH=$($script:benchOk) fail=$($script:fail)")"
+        if ($script:smokeLine) { $rcmd += " --smoke $(& $q $script:smokeLine)" }
+        $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', $rcmd) -Timeout 900 -Tag 'report'
+        $line = (@(@($out) | Where-Object { $_ -match '^REPORT ' } | Select-Object -Last 1) -join '') -replace '^REPORT ', ''
+        if (-not $line) { $line = "FAIL no REPORT line rc=$($script:rc)" }
+        if ($line -like 'ok*') { Write-Output "REPORT=$line" } else { Write-Output "REPORT=WARN $line" }
+    } else { Write-Output 'REPORT=skip (/workspace/bin/install-report.sh absent: INIT did not clone)' }
 }
 return (Done)
 }
