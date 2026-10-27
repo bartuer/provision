@@ -22,6 +22,8 @@
               WEF, ASR, ssh, docker shims, VM boot task).  WS_SKIP_WIN=1 skips.
       BENCH   after WIN: install.sh 10 = bin/bench-ctxcore.sh --fix --make-lane-on, then its --check clean.
               WS_SKIP_BENCH=1 skips.  CLI (in /workspace) opens only if BENCH ok; else a WSL shell there.
+      SMOKE   after CLI (BENCH ok): bin/smoke-addup.sh = one ssg turn via wserver -- new sheet Numbers 1..10,
+              A11 = SUM = 55; the Excel window stays open.  WS_SMOKE=0 skips.
     A distro restart (init.sh says RESTART_NEEDED: systemd was just enabled) is a separate gate
     done here automatically with `wsl --terminate <distro>` -- never `wsl --shutdown`.  It is refused (the
     command is printed for the user instead) when this script runs from inside WSL or when the distro has
@@ -651,10 +653,34 @@ function InitPending {   # the watch ended without the job's rc: say so, never c
 if (-not $init) { Emit 'INIT' "FAIL could not download init.sh from $url -- check the network, then run this bootstrap again"; return (Done) }
 # WSLNET -- a devbox runs WSL in NAT (the WSL default).  MEASURED 2026-10-19 on a Global Secure Access devbox:
 # mirrored resolves archive.ubuntu.com but every connect is "Network is unreachable"; NAT works.
-# So .wslconfig is ALWAYS exactly [wsl2] networkingMode=nat vmIdleTimeout=-1 (old file -> .ws-bak; takes effect
+# So .wslconfig is ALWAYS exactly [wsl2] networkingMode=nat vmIdleTimeout=-1 memory=<75% host>GB swap=16GB (old file -> .ws-bak; takes effect
 # on the next VM start).  Only when the distro cannot reach archive.ubuntu.com NOW: the distro's DNS pins are
 # removed and `wsl --shutdown` runs -- and only when nothing is running.
 $DevWslCfg = [ordered]@{ networkingMode = 'nat'; vmIdleTimeout = '-1' }
+# WSLMEM -- memory = 75% of host RAM + swap=16GB (cluster fix.archive/wsl-memory-75pct.md, port of bin/wslcfg-mem.sh).
+# With no memory= WSL caps the VM at 50% of host RAM: MEASURED 2026-10-25 cj02 (64G host) OOM-killed 4x at 31G.
+# Raise only: a larger memory=/swap= already in .wslconfig is kept.  Applies on the next WSL start, like the rest.
+function WslCfgGB($key) {   # current [wsl2] value of $key in GB (0 if absent); NNGB / NNMB / NNTB / bytes
+    $f = Join-Path $env:USERPROFILE '.wslconfig'; if (-not (Test-Path $f)) { return 0 }
+    $in = $false
+    foreach ($l in Get-Content $f) {
+        $t = $l.Trim(); if ($t -match '^\[(.+)\]$') { $in = ($Matches[1] -eq 'wsl2'); continue }
+        if ($in -and $t -match "^$key\s*=\s*([0-9.]+)\s*([A-Za-z]*)") {
+            $n = [double]$Matches[1]; $u = $Matches[2].ToUpper()
+            if ($u -like 'T*') { $n *= 1024 } elseif ($u -like 'M*') { $n /= 1024 } elseif ($u -notlike 'G*') { $n /= 1GB }
+            return [int][math]::Floor($n)
+        }
+    }
+    return 0
+}
+$WslMemPct = $(if ($env:WSLMEM_PCT) { [int]$env:WSLMEM_PCT } else { 75 })
+$WslSwapGB = $(if ($env:WSLMEM_SWAP_GB) { [int]$env:WSLMEM_SWAP_GB } else { 16 })
+$hostGB = 0; try { $hostGB = [int][math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB) } catch { }
+if ($hostGB -gt 0) {
+    $memGB = [math]::Max([int][math]::Floor($hostGB * $WslMemPct / 100), (WslCfgGB 'memory'))
+    $DevWslCfg['memory'] = "${memGB}GB"
+}
+$DevWslCfg['swap'] = "$([math]::Max($WslSwapGB, (WslCfgGB 'swap')))GB"
 function NetOk {   # DNS AND a TCP connect to archive.ubuntu.com:80 -- "resolves but Network is unreachable" is NOT ok
     $o = InDistro 'timeout 6 getent ahosts archive.ubuntu.com >/dev/null 2>&1 || exit; timeout 10 bash -c "exec 3<>/dev/tcp/archive.ubuntu.com/80" 2>/dev/null && echo NETOK'
     return [bool]($o -match 'NETOK')
@@ -709,6 +735,7 @@ if (-not $Apply) {
     Emit 'INIT' "WOULD run init.sh --apply ($src) as root in $($script:D): WS_URL=$WsUrl -> /workspace + ./install.sh"
     Emit 'WIN' $(if ($env:WS_SKIP_WIN -eq '1') { 'skip (WS_SKIP_WIN=1)' } else { 'WOULD run install.ps1 from the distro (WV2 PIN SHIM WEF ASR SSH DOCKER VMBOOT)' })
     Emit 'BENCH' $(if ($env:WS_SKIP_BENCH -eq '1') { 'skip (WS_SKIP_BENCH=1)' } else { 'WOULD run install.sh 10 (bench-ctxcore.sh --fix --make-lane-on, --check)' })
+    Emit 'SMOKE' $(if ($env:WS_SMOKE -eq '0' -or $env:WS_SKIP_BENCH -eq '1') { 'skip (WS_SMOKE=0)' } else { 'WOULD run bin/smoke-addup.sh after the CLI opens (Excel add-up, window kept open)' })
     return (Done)
 }
 if (-not $distroUp) { Emit 'INIT' "FAIL distro $($script:D) not registered"; return (Done) }
@@ -749,6 +776,16 @@ if ($r -eq 'OK') {
         else { Start-Process -FilePath $path -ArgumentList (($cli | ForEach-Object { Q $_ }) -join ' ') }
         if (-not $script:benchOk) { Emit 'CLI' "NOT opened (BENCH FAIL) -- opened a WSL shell in /workspace; fix, then ./install.sh 10" }
         else { Emit 'CLI' "opened GHCP CLI in officeagent-dev:/workspace (new window; tmux 'main', detach C-b d). Later: wsl, then docker exec -it officeagent-dev bash -> t / h / ec" }
+    }
+    # SMOKE: one real turn through wserver (Excel + our pane -> aserver): new sheet Numbers 1..10, A11 = sum (55).
+    # The Excel window is LEFT OPEN for the user; the next smoke closes only windows it kept itself.
+    # $env:WS_SMOKE=0 skips.  bin/smoke-addup.sh settles the pane first (the NAA relay reloads it once ~10 s in).
+    if ($script:benchOk -and $env:WS_SMOKE -ne '0' -and $env:WS_SKIP_BENCH -ne '1') {
+        Step "SMOKE: ssg add-up via wserver (sheet Numbers 1..10, A11=SUM -> 55; Excel stays open)"
+        $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', 'cd /workspace && bin/smoke-addup.sh') -Timeout 600 -Tag 'smoke'
+        $line = (@(@($out) | Where-Object { $_ -match '^SMOKE ' } | Select-Object -Last 1) -join '') -replace '^SMOKE ', ''
+        if (-not $line) { $line = "FAIL no SMOKE line rc=$($script:rc)" }
+        if ($line -like 'ok*') { Emit 'SMOKE' $line } else { Emit 'SMOKE' "$line (re-run: wsl -u root, cd /workspace, bin/smoke-addup.sh)" }
     }
 }
 else {
