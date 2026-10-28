@@ -78,7 +78,7 @@ function Native([string]$exe, [string[]]$a, [int]$Timeout = 120, [string]$Tag = 
     try { $p.StandardInput.Close() } catch {}
     $rd = @(@{ s = $p.StandardOutput; b = New-Object char[] 4096; t = $null; acc = ''; done = $false },
             @{ s = $p.StandardError;  b = New-Object char[] 4096; t = $null; acc = ''; done = $false })
-    $sw = [Diagnostics.Stopwatch]::StartNew(); $last = 0; $cr = $false
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $last = 0; $cr = $false; $said = $false
     $show = { param($l, $isCr)
         $l = ($l -replace "`0", '').TrimEnd()
         if ($l -eq '') { return }
@@ -109,8 +109,11 @@ function Native([string]$exe, [string[]]$a, [int]$Timeout = 120, [string]$Tag = 
             if ($script:crOpen) { Write-Host ''; $script:crOpen = $false }
             Write-Host "  ${Tag}: TIMEOUT after $([int]$t)s -- stopped this wsl.exe CLIENT only (the WSL VM and distros keep running): $cmdline"; $script:rc = 1460; return @($out)
         }
+        # heartbeat: the command once (cut to 120 chars -- report's --smoke carries the whole answer), then elapsed only
         if ($t - $last -ge 15) { if ($script:crOpen) { Write-Host ''; $script:crOpen = $false }
-                                 Write-Host "  ${Tag}: ... still running $([int]$t)s (timeout ${Timeout}s): $cmdline"; $last = $t }
+                                 $hb = "  ${Tag}: ... still running $([int]$t)s (timeout ${Timeout}s)"
+                                 if (-not $said) { $c = $cmdline; if ($c.Length -gt 120) { $c = $c.Substring(0, 117) + '...' }; $hb += ": $c"; $said = $true }
+                                 Write-Host $hb; $last = $t }
         if (-not $busy) { Start-Sleep -Milliseconds 100 }
         if ($t -ge 2) { Write-Progress -Activity "${Tag}: $cmdline" -Status ("{0}s elapsed (timeout {1}s)" -f [int]$t, $Timeout) -PercentComplete ([math]::Min(99, [int](100 * $t / $Timeout))) }
     }
