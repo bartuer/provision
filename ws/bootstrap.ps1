@@ -241,7 +241,8 @@ if (-not $have) {
     # new laptop 2026-10-30: wsl --install --web-download -> 'Forbidden (403)' = its GitHub API release lookup (rate limit /
     # corp proxy), before AND after a reboot.  Fallback: the pinned WSL MSI by its plain release URL (no API), then the
     # distro again (wsl's own distro list is raw.githubusercontent, not the API).
-    if (-not (HaveDistro)) {
+    Native 'wsl.exe' @('--version') | Out-Null; $engine = ($script:rc -eq 0)   # engine already there: the 403 is the distro fetch, skip the msi (3010 would loop the reboot)
+    if (-not (HaveDistro) -and -not $engine) {
         $msi = Join-Path $env:TEMP ($WslMsi -split '/')[-1]
         Step "WSL: fallback -- WSL engine from $WslMsi (no GitHub API), then the distro"
         try { Start-BitsTransfer -Source $WslMsi -Destination $msi -DisplayName 'download wsl msi' -ErrorAction Stop }
@@ -249,6 +250,22 @@ if (-not $have) {
         if (Test-Path $msi) { Live 'msiexec.exe' @('/i', $msi, '/qn', '/norestart') -What 'install wsl msi' -Timeout 900; Remove-Item $msi -ErrorAction SilentlyContinue
             if ($script:rc -eq 3010) { Emit 'WSL' 'REBOOT WSL engine installed, Windows asks for a reboot -- reboot, then run the same command again'; return (Done 'REBOOT_NEEDED') }
             Live 'wsl.exe' @('--install', '-d', $script:D, '--no-launch') -What "wsl --install -d $($script:D) (after msi)" }
+    }
+    # new laptop 10-30 (latest OS): still 403 after the msi = the distro fetch itself is blocked.  Fallback 2: the
+    # distro image from releases.ubuntu.com (the Url+Sha256 of microsoft/WSL DistributionInfo.json), no GitHub at all,
+    # then `wsl --install --from-file` (WSL >= 2.4.4), else `wsl --import` (init.sh creates INIT_USER itself).
+    if (-not (HaveDistro) -and $script:D -eq "Ubuntu-$WantVersion") {
+        $img = Join-Path $env:TEMP ($DistroImg -split '/')[-1]
+        Step "WSL: fallback -- $($script:D) image from $DistroImg (no GitHub)"
+        try { Start-BitsTransfer -Source $DistroImg -Destination $img -DisplayName 'download ubuntu wsl image' -ErrorAction Stop }
+        catch { try { Invoke-WebRequest -UseBasicParsing $DistroImg -OutFile $img } catch { Write-Host "  WSL: image download failed: $($_.Exception.Message)" } }
+        if ((Test-Path $img) -and ((Get-FileHash $img -Algorithm SHA256).Hash -ne $DistroSha)) { Write-Host "  WSL: image sha256 mismatch, dropped"; Remove-Item $img -ErrorAction SilentlyContinue }
+        if (Test-Path $img) {
+            Live 'wsl.exe' @('--install', '--from-file', $img, '--name', $script:D, '--no-launch') -What "wsl --install --from-file ($($script:D))" -Timeout 900
+            if (-not (HaveDistro)) {
+                $dir = Join-Path $env:LOCALAPPDATA "wsl\$($script:D)"; New-Item -ItemType Directory -Force $dir | Out-Null
+                Live 'wsl.exe' @('--import', $script:D, $dir, $img, '--version', '2') -What "wsl --import $($script:D)" -Timeout 900 }
+            Remove-Item $img -ErrorAction SilentlyContinue }
     }
     if (-not (HaveDistro) -and (RebootPending)) { Emit 'WSL' "REBOOT Windows features for WSL are pending a reboot (wsl --install rc=$($script:rc)) -- reboot, then run the same command again"; return (Done 'REBOOT_NEEDED') }
     if (-not (HaveDistro)) { Emit 'WSL' "FAIL $($script:D) not registered after wsl --install (rc=$($script:rc)) -- if wsl asked for a Windows reboot, reboot and run this again"; return (Done) }
@@ -372,6 +389,8 @@ else {
 # LTS (= the version the fleet was repaired to), and upgrade an older one in place (MSI major upgrade).
 $NodeMin = 24
 $WslMsi = 'https://github.com/microsoft/WSL/releases/download/2.7.14/wsl.2.7.14.0.x64.msi'   # = fleet c17 `wsl --version`; plain release URL, no API
+$DistroImg = 'https://releases.ubuntu.com/26.04.1/ubuntu-26.04.1-wsl-amd64.wsl'   # = microsoft/WSL DistributionInfo.json Ubuntu-26.04
+$DistroSha = '48D56724B5C8E60F24893E83E73BBB58C60B3CA22FBA3DA977075420ACD54104'
 $NodePin = 'https://nodejs.org/dist/v24.22.1/node-v24.22.1-x64.msi'
 $NodeExe = "$env:ProgramFiles\nodejs\node.exe"
 function NodeVer { if (Test-Path -LiteralPath $NodeExe) { "$((& $NodeExe --version 2>$null) -join '')".Trim() } else { '' } }
