@@ -461,7 +461,7 @@ function OfficeUpdTaskOn { @(Get-ScheduledTask -TaskPath '\Microsoft\Office\' -E
 function ExcelState {
     $v = ''; if (Test-Path -LiteralPath $ExcelExe) { $v = (Get-Item -LiteralPath $ExcelExe).VersionInfo.ProductVersion }
     $c = Get-ItemProperty $C2rCfg -ErrorAction SilentlyContinue
-    $tasks = OfficeUpdTaskOn
+    $tasks = @(OfficeUpdTaskOn)   # @(): no enabled task returns NOTHING, and $null.Count read as "" -> upd stayed True on a fully-off box
     $p = Get-ItemProperty $OfficePol -ErrorAction SilentlyContinue; $pol = $p.enableautomaticupdates
     $chan = $(if ("$($c.UpdateChannel)$($c.UpdateUrl)" -and ("$($c.UpdateChannel)" -notmatch $DevMainGuid -or "$($c.UpdateUrl)" -notmatch $DevMainGuid)) { 'off-devmain' } else { 'devmain' })
     $pin = $(if ($v -and "$($p.updatetoversion)" -ne $v) { 'unpinned' } else { 'pinned' })
@@ -882,6 +882,22 @@ $script:exitCode = 0
 $LogFile = Join-Path $env:TEMP 'ws-bootstrap.log'
 try { Start-Transcript -Path $LogFile -Append -ErrorAction Stop | Out-Null; $tr = $true } catch { $tr = $false }
 Write-Host "-- log: $LogFile  (watch from another window: Get-Content -Wait '$LogFile')"
-Main
+# AWAKE: a laptop that sleeps mid-install drops Wi-Fi, and apt / git clone / LFS / docker pull die as "network
+# failure" (MEASURED 2026-10-30 on the new laptop).  SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED) holds
+# off idle sleep while THIS PowerShell runs (it waits on init.sh + install.sh to the end) and is released in the
+# finally -- and by Windows itself when the process exits, so nothing persists: no powercfg change.  A lid close or
+# the Start-menu Sleep still sleeps the box (that is the user's action, not idle); WS_KEEP_AWAKE=0 skips.
+$script:awake = $false
+if ($env:WS_KEEP_AWAKE -ne '0') {
+    try {
+        Add-Type -Namespace WsBoot -Name Power -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint f);' -ErrorAction Stop
+        $script:awake = ([WsBoot.Power]::SetThreadExecutionState([uint32]'0x80000001') -ne 0)   # ES_CONTINUOUS|ES_SYSTEM_REQUIRED
+    } catch {}
+}
+Write-Output "AWAKE=$(if ($script:awake) { 'ok (idle sleep held off until this bootstrap ends; keep the lid open)' } elseif ($env:WS_KEEP_AWAKE -eq '0') { 'skip' } else { 'WARN could not hold off sleep -- set Power to never sleep while installing' })"
+try { Main }
+finally {
+    if ($script:awake) { try { [WsBoot.Power]::SetThreadExecutionState([uint32]'0x80000000') | Out-Null } catch {} }   # ES_CONTINUOUS alone = release
+}
 if ($tr) { try { Stop-Transcript | Out-Null } catch {} }
 if ($PSCommandPath) { exit $script:exitCode }   # -File: rc; irm|iex: never close the console
