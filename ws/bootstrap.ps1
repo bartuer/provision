@@ -894,6 +894,27 @@ return (Done)
 }
 $script:exitCode = 0
 $LogFile = Join-Path $env:TEMP 'ws-bootstrap.log'
+# ELEVATE: the real run needs admin (WSL/distro install, Excel/M365, and WIN's WebView2 149 pin -- without the pin
+# Excel's WV2 150+ strips --ignore-certificate-errors and the pane says "invalid security certificate"; laptop
+# 2026-10-30).  Not elevated -> relaunch THIS bootstrap in an Administrator window (one UAC prompt) and stop here.
+# An elevated process does not inherit our env, so the WS_* knobs + params are passed on its command line.
+# Dry runs stay where they are; WS_NO_ELEVATE=1 opts out; UAC declined -> carry on here (WIN asks once more).
+$isAdminNow = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+              ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($Apply -and -not $isAdminNow -and $env:WS_NO_ELEVATE -ne '1') {
+    $kv = @{}; Get-ChildItem Env: | Where-Object { $_.Name -like 'WS_*' } | ForEach-Object { $kv[$_.Name] = $_.Value }
+    if ($AllowRestart) { $kv['WS_ALLOW_RESTART'] = '1' }; if ($Distro) { $kv['WS_DISTRO'] = $Distro }; if ($User) { $kv['WS_USER'] = $User }
+    $kv['WS_NO_ELEVATE'] = '1'                                     # the child never loops back here
+    $set = ($kv.GetEnumerator() | ForEach-Object { "`$env:$($_.Key)='$($_.Value -replace "'", "''")'" }) -join '; '
+    $run = $(if ($PSCommandPath) { "& '$($PSCommandPath -replace "'", "''")'" }
+             else { "irm '$($DefaultInitUrl -replace '/init\.sh$', '/bootstrap.ps1')' | iex" })
+    Write-Output "ELEVATE=asking UAC: the install continues in a NEW Administrator window (this one can be closed)"
+    try {
+        Start-Process powershell.exe -Verb RunAs -ArgumentList @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', "$set; $run") -ErrorAction Stop | Out-Null
+        Write-Output 'RESULT=ELEVATED (see the Administrator window)'
+        if ($PSCommandPath) { exit 0 }; return
+    } catch { Write-Output "ELEVATE=WARN UAC declined ($($_.Exception.Message)); continuing NOT elevated -- WSL/Excel installs and the WebView2 pin will fail" }
+}
 try { Start-Transcript -Path $LogFile -Append -ErrorAction Stop | Out-Null; $tr = $true } catch { $tr = $false }
 Write-Host "-- log: $LogFile  (watch from another window: Get-Content -Wait '$LogFile')"
 # AWAKE: a laptop that sleeps mid-install drops Wi-Fi, and apt / git clone / LFS / docker pull die as "network
