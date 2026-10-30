@@ -237,11 +237,15 @@ if (-not $have) {
     if (-not $Apply) { Emit 'WSL' "WOULD wsl --install -d $($script:D) --no-launch (WSL2; then maybe a Windows reboot)"; return (Done) }
     if (-not $isAdmin) { Emit 'WSL' 'FAIL not admin: re-run from an elevated PowerShell'; return (Done) }
     Step "WSL: wsl --install -d $($script:D) --no-launch --web-download (WSL engine + distro, WSL2; wsl's own progress below)"
-    Live 'wsl.exe' @('--install', '-d', $script:D, '--no-launch', '--web-download') -What "wsl --install -d $($script:D)"
+    Native 'wsl.exe' @('--version') | Out-Null; $engine = ($script:rc -eq 0)
+    $cacheImg = Join-Path $env:LOCALAPPDATA ('ws-bootstrap\' + ($DistroImg -split '/')[-1])
+    # engine there + Ubuntu-26.04: go straight to the cached/direct image (a re-run must not download it again via wsl.exe)
+    if (-not ($engine -and $script:D -eq "Ubuntu-$WantVersion")) {
+        Live 'wsl.exe' @('--install', '-d', $script:D, '--no-launch', '--web-download') -What "wsl --install -d $($script:D)" }
     # new laptop 2026-10-30: wsl --install --web-download -> 'Forbidden (403)' = its GitHub API release lookup (rate limit /
     # corp proxy), before AND after a reboot.  Fallback: the pinned WSL MSI by its plain release URL (no API), then the
     # distro again (wsl's own distro list is raw.githubusercontent, not the API).
-    Native 'wsl.exe' @('--version') | Out-Null; $engine = ($script:rc -eq 0)   # engine already there: the 403 is the distro fetch, skip the msi (3010 would loop the reboot)
+    # engine already there: the 403 is the distro fetch, skip the msi (3010 would loop the reboot)
     if (-not (HaveDistro) -and -not $engine) {
         $msi = Join-Path $env:TEMP ($WslMsi -split '/')[-1]
         Step "WSL: fallback -- WSL engine from $WslMsi (no GitHub API), then the distro"
@@ -255,17 +259,19 @@ if (-not $have) {
     # distro image from releases.ubuntu.com (the Url+Sha256 of microsoft/WSL DistributionInfo.json), no GitHub at all,
     # then `wsl --install --from-file` (WSL >= 2.4.4), else `wsl --import` (init.sh creates INIT_USER itself).
     if (-not (HaveDistro) -and $script:D -eq "Ubuntu-$WantVersion") {
-        $img = Join-Path $env:TEMP ($DistroImg -split '/')[-1]
-        Step "WSL: fallback -- $($script:D) image from $DistroImg (no GitHub)"
+        $img = $cacheImg; New-Item -ItemType Directory -Force (Split-Path $img) | Out-Null
+        if ((Test-Path $img) -and ((Get-FileHash $img -Algorithm SHA256).Hash -eq $DistroSha)) { Step "WSL: $($script:D) image already downloaded ($img, sha256 ok) -- no download" }
+        else { Remove-Item $img -ErrorAction SilentlyContinue
+        Step "WSL: fallback -- $($script:D) image from $DistroImg (no GitHub) -> $img (kept until the distro is registered)"
         try { Start-BitsTransfer -Source $DistroImg -Destination $img -DisplayName 'download ubuntu wsl image' -ErrorAction Stop }
-        catch { try { Invoke-WebRequest -UseBasicParsing $DistroImg -OutFile $img } catch { Write-Host "  WSL: image download failed: $($_.Exception.Message)" } }
+        catch { try { Invoke-WebRequest -UseBasicParsing $DistroImg -OutFile $img } catch { Write-Host "  WSL: image download failed: $($_.Exception.Message)" } } }
         if ((Test-Path $img) -and ((Get-FileHash $img -Algorithm SHA256).Hash -ne $DistroSha)) { Write-Host "  WSL: image sha256 mismatch, dropped"; Remove-Item $img -ErrorAction SilentlyContinue }
         if (Test-Path $img) {
             Live 'wsl.exe' @('--install', '--from-file', $img, '--name', $script:D, '--no-launch') -What "wsl --install --from-file ($($script:D))" -Timeout 900
             if (-not (HaveDistro)) {
                 $dir = Join-Path $env:LOCALAPPDATA "wsl\$($script:D)"; New-Item -ItemType Directory -Force $dir | Out-Null
                 Live 'wsl.exe' @('--import', $script:D, $dir, $img, '--version', '2') -What "wsl --import $($script:D)" -Timeout 900 }
-            Remove-Item $img -ErrorAction SilentlyContinue }
+            if (HaveDistro) { Remove-Item $img -ErrorAction SilentlyContinue } }
     }
     if (-not (HaveDistro) -and (RebootPending)) { Emit 'WSL' "REBOOT Windows features for WSL are pending a reboot (wsl --install rc=$($script:rc)) -- reboot, then run the same command again"; return (Done 'REBOOT_NEEDED') }
     if (-not (HaveDistro)) { Emit 'WSL' "FAIL $($script:D) not registered after wsl --install (rc=$($script:rc)) -- if wsl asked for a Windows reboot, reboot and run this again"; return (Done) }
@@ -311,14 +317,22 @@ function GhInstall([string]$repo, [string]$pattern, [string[]]$args2, [string]$w
         } catch { Write-Host "  ${what}: release page failed ($($_.Exception.Message))" }
     }
     if (-not $u) { Write-Host "  ${what}: no installer matching $pattern found"; $script:rc = 2; return }
-    $exe = Join-Path $env:TEMP $name
-    Step "${what}: download $name"
-    try { Start-BitsTransfer -Source $u -Destination $exe -DisplayName "download $name" -ErrorAction Stop }
-    catch { Write-Host "  ${what}: BITS failed ($($_.Exception.Message)), plain download"
-            try { $ProgressPreference = 'Continue'; Invoke-WebRequest -UseBasicParsing $u -OutFile $exe } catch { Write-Host "  ${what}: download failed: $($_.Exception.Message)"; $script:rc = 3; return } }
-    Step "${what}: $name (silent install)"
+    # cached in %LOCALAPPDATA%\ws-bootstrap (laptop 10-30: every re-run downloaded it again); a complete file is
+    # renamed in from .part, so a present file = a whole download; it is removed only after a clean install
+    $cache = Join-Path $env:LOCALAPPDATA 'ws-bootstrap'; New-Item -ItemType Directory -Force $cache | Out-Null
+    $exe = Join-Path $cache $name
+    if (Test-Path $exe) { Step "${what}: $name already downloaded ($exe) -- no download" }
+    else {
+        $part = "$exe.part"; Remove-Item $part -ErrorAction SilentlyContinue
+        Step "${what}: download $name"
+        try { Start-BitsTransfer -Source $u -Destination $part -DisplayName "download $name" -ErrorAction Stop }
+        catch { Write-Host "  ${what}: BITS failed ($($_.Exception.Message)), plain download"
+                try { $ProgressPreference = 'Continue'; Invoke-WebRequest -UseBasicParsing $u -OutFile $part } catch { Write-Host "  ${what}: download failed: $($_.Exception.Message)"; $script:rc = 3; return } }
+        Move-Item $part $exe -Force
+    }
+    Step "${what}: $name (silent install; Defender scans every file, a few minutes on a new box)"
     Live $exe $args2 -What "install $name" -Timeout 1200
-    Remove-Item $exe -ErrorAction SilentlyContinue
+    if ($script:rc -eq 0) { Remove-Item $exe -ErrorAction SilentlyContinue }
 }
 function WingetInstall([string]$id, [string]$what) {
     if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) { return }
