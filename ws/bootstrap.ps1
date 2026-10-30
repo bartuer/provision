@@ -9,7 +9,8 @@
     RESTART_NEEDED|REFUSED.
       ADMIN   elevated?  (a real run needs it for WSL / DISTRO installs)
       WSL     Ubuntu-26.04 on WSL2: absent -> `wsl --install -d Ubuntu-26.04 --no-launch` (engine + distro in one
-              step, live progress; no reboot)
+              step, live progress); a first install whose Windows features wait for a reboot (wsl --install then fails
+              e.g. 'Forbidden (403)') -> RESULT=REBOOT_NEEDED: reboot, re-run the same command)
       GIT     git.exe; absent -> Git for Windows from its GitHub release (winget only as fallback)
       GCM     `git credential-manager --version`; absent -> comes with Git, else the GCM GitHub release
       NODE    Windows node.exe >= v24 (tserver mints the ADO token via WAM under Windows node); absent OR older
@@ -122,6 +123,10 @@ function Native([string]$exe, [string[]]$a, [int]$Timeout = 120, [string]$Tag = 
     Write-Progress -Activity "${Tag}: $cmdline" -Completed
     return @($out)
 }
+function RebootPending {   # CBS / WU reboot keys or an EnablePending WSL feature = Windows waits for a reboot (e.g. VirtualMachinePlatform just enabled)
+    (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+    (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or
+    [bool](@('VirtualMachinePlatform', 'Microsoft-Windows-Subsystem-Linux' | ForEach-Object { Get-WindowsOptionalFeature -Online -FeatureName $_ -ErrorAction SilentlyContinue }) | Where-Object { "$($_.State)" -eq 'EnablePending' }) }
 function Step([string]$m) { Write-Host "-- $m" }
 function Live([string]$exe, [string[]]$a, [int]$Timeout = 1800, [string]$What = '') {
     # run a long native step ON THIS CONSOLE (not redirected), so wsl.exe / winget draw their own % progress bar;
@@ -234,6 +239,9 @@ if (-not $have) {
     if (-not $isAdmin) { Emit 'WSL' 'FAIL not admin: re-run from an elevated PowerShell'; return (Done) }
     Step "WSL: wsl --install -d $($script:D) --no-launch --web-download (WSL engine + distro, WSL2; wsl's own progress below)"
     Live 'wsl.exe' @('--install', '-d', $script:D, '--no-launch', '--web-download') -What "wsl --install -d $($script:D)"
+    # a first WSL install on a new box (laptop 2026-10-30): the Windows features are pending a reboot and wsl --install
+    # --web-download fails 'Forbidden (403)' -- not a FAIL: reboot, then the same irm|iex resumes from here.
+    if (-not (HaveDistro) -and (RebootPending)) { Emit 'WSL' "REBOOT Windows features for WSL are pending a reboot (wsl --install rc=$($script:rc)) -- reboot, then run the same command again"; return (Done 'REBOOT_NEEDED') }
     if (-not (HaveDistro)) { Emit 'WSL' "FAIL $($script:D) not registered after wsl --install (rc=$($script:rc)) -- if wsl asked for a Windows reboot, reboot and run this again"; return (Done) }
     Emit 'WSL' "did wsl --install -d $($script:D) --no-launch --web-download"
 }
