@@ -190,7 +190,21 @@ function WinTier {
     $savedPMP = $env:PSModulePath
     if ($PSVersionTable.PSEdition -eq 'Core') {
         $env:PSModulePath = (@([Environment]::GetEnvironmentVariable('PSModulePath', 'User'), [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')) | Where-Object { $_ }) -join ';' }
-    try { $out = Native $ps @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$dst\install.ps1", '-Distro', $script:D, '-Repo', '/workspace') -Timeout 900 -Tag 'install.ps1' }
+    try {
+        if ($isAdmin) { $out = Native $ps @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$dst\install.ps1", '-Distro', $script:D, '-Repo', '/workspace') -Timeout 900 -Tag 'install.ps1' }
+        else {
+            # NOT elevated (laptop 2026-10-30: PIN=FAIL rc=2 -> Excel on the shipped WV2 150+, which strips
+            # --ignore-certificate-errors -> pane "invalid security certificate" -> SMOKE connect timeout).
+            # Only this step needs admin: ONE UAC prompt, output captured to a log and parsed as before.
+            $log = Join-Path $dst 'install.ps1.log'; Remove-Item $log -EA SilentlyContinue
+            Write-Host "  install.ps1: not elevated -- approve the UAC prompt (WebView2 pin + cert args need admin)"
+            $cmd = "& '$dst\install.ps1' -Distro '$($script:D)' -Repo '/workspace' *>&1 | Out-File -Encoding utf8 '$log'"
+            try { $p = Start-Process $ps -Verb RunAs -Wait -PassThru -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $cmd) }
+            catch { Write-Host "  install.ps1: UAC declined ($($_.Exception.Message))" }
+            $out = @(if (Test-Path $log) { Get-Content $log } else { 'RESULT=FAIL UAC declined / no log' })
+            $out | ForEach-Object { Write-Host "  install.ps1: $_" }
+        }
+    }
     finally { $env:PSModulePath = $savedPMP }
     $res = (@($out) | Where-Object { $_ -match '^RESULT=' } | Select-Object -Last 1) -replace '^RESULT=', ''
     $bad = @(@($out) | Where-Object { $_ -match '^[A-Z0-9_]+=(ABSENT|MISSING|FAIL|NO)' }) -join '; '
