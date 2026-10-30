@@ -896,12 +896,12 @@ $script:exitCode = 0
 $LogFile = Join-Path $env:TEMP 'ws-bootstrap.log'
 # ELEVATE + PWSH: the real run needs (1) admin -- WSL/distro install, Excel/M365, and WIN's WebView2 149 pin (no pin
 # -> Excel's WV2 150+ strips --ignore-certificate-errors -> pane "invalid security certificate", laptop 2026-10-30)
-# and (2) PowerShell 7.6 (pwsh): UTF-8 native pipes and sane wsl.exe/bash quoting, where 5.1 mangles both.
+# and (2) PowerShell 7.6+ (pwsh): UTF-8 native pipes and sane wsl.exe/bash quoting, where 5.1 mangles both.
 # Either missing -> write a launcher to %TEMP% and run it ELEVATED (one UAC prompt; already admin = no prompt): it
-# installs pwsh 7.6 (pinned MSI, cached) if absent/older, then re-runs this bootstrap in pwsh IN THAT WINDOW.
+# installs the LATEST pwsh (GitHub releases/latest MSI; known MSI as fallback) if absent/<7.6, then re-runs this bootstrap in pwsh IN THAT WINDOW.
 # An elevated process does not inherit our env, so WS_* + params are written into the launcher.
 # Dry runs stay where they are; WS_NO_ELEVATE=1 opts out; UAC declined -> carry on here as before.
-$PwshPin = 'https://github.com/PowerShell/PowerShell/releases/download/v7.6.9/PowerShell-7.6.9-win-x64.msi'
+$PwshFallback = 'https://github.com/PowerShell/PowerShell/releases/download/v7.6.9/PowerShell-7.6.9-win-x64.msi'   # only if releases/latest is unreachable
 $isAdminNow = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
               ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $isPwsh76 = $PSVersionTable.PSVersion -ge [version]'7.6'
@@ -914,33 +914,37 @@ if ($Apply -and -not ($isAdminNow -and $isPwsh76) -and $env:WS_NO_ELEVATE -ne '1
              else { "irm '$($DefaultInitUrl -replace '/init\.sh$', '/bootstrap.ps1')' | iex" })
     $launcher = Join-Path $env:TEMP 'ws-bootstrap-launch.ps1'
     @"
-# written by bootstrap.ps1: admin + pwsh 7.6, then the bootstrap again
+# written by bootstrap.ps1: admin + latest pwsh (>= 7.6), then the bootstrap again
 $set
 function PwshOk { `$p = @((Get-Command pwsh.exe -EA 0).Source, "`$env:ProgramFiles\PowerShell\7\pwsh.exe") | Where-Object { `$_ -and (Test-Path `$_) } | Select-Object -First 1
     if (`$p -and [version](((Get-Item `$p).VersionInfo.ProductVersion -split '[ -]')[0]) -ge [version]'7.6') { return `$p } }
 `$pw = PwshOk
 if (-not `$pw) {
     `$cache = Join-Path `$env:LOCALAPPDATA 'ws-bootstrap'; New-Item -ItemType Directory -Force `$cache | Out-Null
-    `$msi = Join-Path `$cache '$(($PwshPin -split '/')[-1])'
-    if (-not (Test-Path `$msi)) { Write-Host '-- PWSH: download PowerShell 7.6 ($PwshPin)'
-        try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-        try { Start-BitsTransfer -Source '$PwshPin' -Destination "`$msi.part" -ErrorAction Stop } catch { Invoke-WebRequest -UseBasicParsing '$PwshPin' -OutFile "`$msi.part" }
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+    `$url = '$PwshFallback'
+    try { `$url = (Invoke-RestMethod -UseBasicParsing 'https://api.github.com/repos/PowerShell/PowerShell/releases/latest' -TimeoutSec 20).assets |
+              Where-Object { `$_.name -like '*-win-x64.msi' } | Select-Object -First 1 -ExpandProperty browser_download_url } catch {}
+    if (-not `$url) { `$url = '$PwshFallback' }
+    `$msi = Join-Path `$cache ((`$url -split '/')[-1])
+    if (-not (Test-Path `$msi)) { Write-Host "-- PWSH: download latest PowerShell (`$url)"
+        try { Start-BitsTransfer -Source `$url -Destination "`$msi.part" -ErrorAction Stop } catch { Invoke-WebRequest -UseBasicParsing `$url -OutFile "`$msi.part" }
         Move-Item "`$msi.part" `$msi -Force }
-    Write-Host '-- PWSH: install PowerShell 7.6 (msiexec, silent)'
+    Write-Host "-- PWSH: install `$((`$msi -split '\\')[-1]) (msiexec, silent)"
     `$p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', "``"`$msi``"", '/qn', '/norestart', 'ADD_PATH=1', 'REGISTER_MANIFEST=1')
     Write-Host "PWSH=msiexec rc=`$(`$p.ExitCode)"
     `$pw = PwshOk
 }
-if (`$pw) { Write-Host "PWSH=ok `$pw -- bootstrap continues in PowerShell 7.6 (Administrator)"
+if (`$pw) { Write-Host "PWSH=ok `$pw -- bootstrap continues in PowerShell `$((Get-Item `$pw).VersionInfo.ProductVersion) (Administrator)"
             & `$pw -NoExit -NoProfile -ExecutionPolicy Bypass -Command "$($run -replace '"', '`"')" }
 else { Write-Host 'PWSH=WARN install failed -- bootstrap continues in Windows PowerShell 5.1 (Administrator)'; $run }
 "@ | Set-Content -Encoding UTF8 $launcher
     if ($isAdminNow) {
-        Write-Output "ELEVATE=already admin; PWSH=switching this window to PowerShell 7.6"
+        Write-Output "ELEVATE=already admin; PWSH=switching this window to PowerShell 7 (latest)"
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $launcher
         if ($PSCommandPath) { exit 0 }; return
     }
-    Write-Output "ELEVATE=asking UAC: the install continues in a NEW Administrator window on PowerShell 7.6 (this one can be closed)"
+    Write-Output "ELEVATE=asking UAC: the install continues in a NEW Administrator window on PowerShell 7 (latest) (this one can be closed)"
     try {
         Start-Process powershell.exe -Verb RunAs -ArgumentList @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$launcher`"") -ErrorAction Stop | Out-Null
         Write-Output 'RESULT=ELEVATED (see the Administrator window)'
