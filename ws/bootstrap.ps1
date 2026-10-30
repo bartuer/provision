@@ -700,6 +700,13 @@ if (-not $init) { Emit 'INIT' "FAIL could not download init.sh from $url -- chec
 # on the next VM start).  Only when the distro cannot reach archive.ubuntu.com NOW: the distro's DNS pins are
 # removed and `wsl --shutdown` runs -- and only when nothing is running.
 $DevWslCfg = [ordered]@{ networkingMode = 'nat'; vmIdleTimeout = '-1' }
+# A cluster-enrolled box (cluster bin/box-bootstrap.sh) runs MIRRORED: peers reach its 10.30 address on :2200/:2222.
+# Rewriting it to NAT hid helix from the fleet (2026-10-30).  So an existing networkingMode=mirrored is KEPT
+# (NetOk below still falls back to NAT + wsl --shutdown if the mirrored distro has no network); WS_NET=nat|mirrored forces it.
+$curNet = $null; $wcf = Join-Path $env:USERPROFILE '.wslconfig'
+if (Test-Path $wcf) { $m = Select-String -Path $wcf -Pattern '^\s*networkingMode\s*=\s*(\w+)' | Select-Object -First 1; if ($m) { $curNet = $m.Matches[0].Groups[1].Value.ToLower() } }
+if ($env:WS_NET -in @('nat', 'mirrored')) { $DevWslCfg['networkingMode'] = $env:WS_NET }
+elseif ($curNet -eq 'mirrored') { $DevWslCfg['networkingMode'] = 'mirrored' }
 # WSLMEM -- memory = 75% of host RAM + swap=16GB (cluster fix.archive/wsl-memory-75pct.md, port of bin/wslcfg-mem.sh).
 # With no memory= WSL caps the VM at 50% of host RAM: MEASURED 2026-10-25 cj02 (64G host) OOM-killed 4x at 31G.
 # Raise only: a larger memory=/swap= already in .wslconfig is kept.  Applies on the next WSL start, like the rest.
@@ -762,6 +769,7 @@ function FixWslNet {
         $busy += @(Native 'wsl.exe' @('-d', $d.name, '-u', 'root', '-e', 'sh', '-c', 'command -v docker >/dev/null && docker ps -q 2>/dev/null; command -v tmux >/dev/null && tmux ls 2>/dev/null') -Timeout 30 | Where-Object { $_ -match '\S' })
     }
     if ($busy.Count) { Emit 'WSLNET' "REFUSE distro network is broken; .wslconfig is now [wsl2] $desc but running containers/tmux ($($busy.Count)) block the restart -- stop them, then: wsl --shutdown ; and run this again"; $script:netOk = $false; return }
+    if ($DevWslCfg['networkingMode'] -eq 'mirrored' -and $env:WS_NET -ne 'mirrored') { $DevWslCfg['networkingMode'] = 'nat'; $null = WslCfgSet $DevWslCfg; $desc = ($DevWslCfg.Keys | ForEach-Object { "$_=$($DevWslCfg[$_])" }) -join ' ' }
     Step "WSLNET: distro network is broken; .wslconfig = [wsl2] $desc; restarting the WSL VM (wsl --shutdown) -- nothing was running"
     # earlier DNS pins (static resolv.conf, generateResolvConf=false) would override WSL's own DNS
     $null = InDistro "sed -i '/^generateResolvConf/d' /etc/wsl.conf 2>/dev/null; [ -L /etc/resolv.conf ] || rm -f /etc/resolv.conf"
