@@ -123,9 +123,8 @@ function Native([string]$exe, [string[]]$a, [int]$Timeout = 120, [string]$Tag = 
     Write-Progress -Activity "${Tag}: $cmdline" -Completed
     return @($out)
 }
-function RebootPending {   # CBS / WU reboot keys or an EnablePending WSL feature = Windows waits for a reboot (e.g. VirtualMachinePlatform just enabled)
-    (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
-    (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or
+function RebootPending {   # a WSL Windows feature enabled but not active until a reboot (CBS/WU keys are NOT used:
+    # on a managed laptop they stay set after the reboot, laptop 2026-10-30)
     [bool](@('VirtualMachinePlatform', 'Microsoft-Windows-Subsystem-Linux' | ForEach-Object { Get-WindowsOptionalFeature -Online -FeatureName $_ -ErrorAction SilentlyContinue }) | Where-Object { "$($_.State)" -eq 'EnablePending' }) }
 function Step([string]$m) { Write-Host "-- $m" }
 function Live([string]$exe, [string[]]$a, [int]$Timeout = 1800, [string]$What = '') {
@@ -239,8 +238,18 @@ if (-not $have) {
     if (-not $isAdmin) { Emit 'WSL' 'FAIL not admin: re-run from an elevated PowerShell'; return (Done) }
     Step "WSL: wsl --install -d $($script:D) --no-launch --web-download (WSL engine + distro, WSL2; wsl's own progress below)"
     Live 'wsl.exe' @('--install', '-d', $script:D, '--no-launch', '--web-download') -What "wsl --install -d $($script:D)"
-    # a first WSL install on a new box (laptop 2026-10-30): the Windows features are pending a reboot and wsl --install
-    # --web-download fails 'Forbidden (403)' -- not a FAIL: reboot, then the same irm|iex resumes from here.
+    # new laptop 2026-10-30: wsl --install --web-download -> 'Forbidden (403)' = its GitHub API release lookup (rate limit /
+    # corp proxy), before AND after a reboot.  Fallback: the pinned WSL MSI by its plain release URL (no API), then the
+    # distro again (wsl's own distro list is raw.githubusercontent, not the API).
+    if (-not (HaveDistro)) {
+        $msi = Join-Path $env:TEMP ($WslMsi -split '/')[-1]
+        Step "WSL: fallback -- WSL engine from $WslMsi (no GitHub API), then the distro"
+        try { Start-BitsTransfer -Source $WslMsi -Destination $msi -DisplayName 'download wsl msi' -ErrorAction Stop }
+        catch { try { Invoke-WebRequest -UseBasicParsing $WslMsi -OutFile $msi } catch { Write-Host "  WSL: msi download failed: $($_.Exception.Message)" } }
+        if (Test-Path $msi) { Live 'msiexec.exe' @('/i', $msi, '/qn', '/norestart') -What 'install wsl msi' -Timeout 900; Remove-Item $msi -ErrorAction SilentlyContinue
+            if ($script:rc -eq 3010) { Emit 'WSL' 'REBOOT WSL engine installed, Windows asks for a reboot -- reboot, then run the same command again'; return (Done 'REBOOT_NEEDED') }
+            Live 'wsl.exe' @('--install', '-d', $script:D, '--no-launch') -What "wsl --install -d $($script:D) (after msi)" }
+    }
     if (-not (HaveDistro) -and (RebootPending)) { Emit 'WSL' "REBOOT Windows features for WSL are pending a reboot (wsl --install rc=$($script:rc)) -- reboot, then run the same command again"; return (Done 'REBOOT_NEEDED') }
     if (-not (HaveDistro)) { Emit 'WSL' "FAIL $($script:D) not registered after wsl --install (rc=$($script:rc)) -- if wsl asked for a Windows reboot, reboot and run this again"; return (Done) }
     Emit 'WSL' "did wsl --install -d $($script:D) --no-launch --web-download"
@@ -362,6 +371,7 @@ else {
 # present at bootstrap time is gone by stage 6 / the next day.  So: require major >= $NodeMin, pin a current
 # LTS (= the version the fleet was repaired to), and upgrade an older one in place (MSI major upgrade).
 $NodeMin = 24
+$WslMsi = 'https://github.com/microsoft/WSL/releases/download/2.7.14/wsl.2.7.14.0.x64.msi'   # = fleet c17 `wsl --version`; plain release URL, no API
 $NodePin = 'https://nodejs.org/dist/v24.22.1/node-v24.22.1-x64.msi'
 $NodeExe = "$env:ProgramFiles\nodejs\node.exe"
 function NodeVer { if (Test-Path -LiteralPath $NodeExe) { "$((& $NodeExe --version 2>$null) -join '')".Trim() } else { '' } }
