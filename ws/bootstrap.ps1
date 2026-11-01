@@ -169,6 +169,12 @@ function Distros {   # @{name=..; ver=..; default=$bool} from `wsl -l -v`
     return $r
 }
 function InDistro([string]$cmd) { return Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', $cmd) -Timeout 30 }
+# plan 10 C.1: live uplink -- one status line to origin install/<host> (best effort; master untouched, no window)
+function Status([string]$line) {
+    if (-not $Apply -or -not $script:D) { return }
+    $l = ($line -replace "[`r`n']", ' '); if ($l.Length -gt 400) { $l = $l.Substring(0, 400) }
+    $null = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', "[ -x /workspace/bin/install-report.sh ] && cd /workspace && bin/install-report.sh --status '$l'") -Timeout 200 -Tag 'status'
+}
 
 # WIN: the Windows half of install (install.ps1: WV2 tree, PIN, SHIM, WEF, ASR, SSH, DOCKER, VMBOOT).  It needs
 # admin, which this bootstrap already is; before 2026-10-21 a new box had to run it by hand and
@@ -209,6 +215,7 @@ function WinTier {
     $res = (@($out) | Where-Object { $_ -match '^RESULT=' } | Select-Object -Last 1) -replace '^RESULT=', ''
     $bad = @(@($out) | Where-Object { $_ -match '^[A-Z0-9_]+=(ABSENT|MISSING|FAIL|NO)' }) -join '; '
     if ($res -eq 'OK') { Emit 'WIN' 'ok install.ps1' } else { Emit 'WIN' "FAIL install.ps1 RESULT=$res $bad (re-run elevated: powershell -ExecutionPolicy Bypass -File $dst\install.ps1 -Distro $($script:D))" }
+    Status $(if ($res -eq 'OK') { 'WIN ok install.ps1' } else { "WIN FAIL install.ps1 RESULT=$res $bad" })
 }
 # BENCH = install.sh 10 (plan 02 E.2): the LAST install stage -- bench-ctxcore.sh --fix --make-lane-on, then its
 # --check (cihc grader at the OA pin, lane on :6030, wserver, win-* rows WIN just fixed) + CLI trusts /workspace.
@@ -216,9 +223,10 @@ function WinTier {
 function BenchReady {
     if ($env:WS_SKIP_BENCH -eq '1') { $script:benchOk = $true; Emit 'BENCH' 'skip (WS_SKIP_BENCH=1)'; return }
     Step "BENCH: install.sh 10 (bench-ctxcore.sh --fix --make-lane-on, then --check)"
-    $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', 'cd /workspace && WS_CLI=0 ./install.sh 10') -Timeout 900 -Tag 'bench'
+    $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', 'cd /workspace && WS_CLI=0 WS_STATUS=1 ./install.sh 10') -Timeout 900 -Tag 'bench'
     $line = @(@($out) | Where-Object { $_ -match '^STAGE=10 ' } | Select-Object -Last 1) -join ''
     $script:benchOk = ($script:rc -eq 0)
+    Status "BENCH $(if ($script:benchOk) { 'ok' } elseif ($script:rc -eq 1460) { 'PENDING timeout 900s' } else { 'FAIL' }) $line"
     if ($script:benchOk) { Emit 'BENCH' "ok $line"; return }
     if ($script:rc -eq 1460) { Emit 'BENCH' "PENDING watch timed out after 900s, install.sh 10 may still run in WSL (check: wsl -u root, cd /workspace, ./install.sh --check 10)"; return }
     Emit 'BENCH' "FAIL $line (re-run: wsl -u root, cd /workspace, ./install.sh 10 -- detail: bin/bench-ctxcore.sh --check)"
@@ -680,7 +688,7 @@ function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding man
         # `script` keeps the pty AND logs to /tmp/ws-init.out; this window shows a progress bar + the last log line.
         $ErrorActionPreference = $old
         $run = "echo `$`$ > /tmp/ws-init.pid; [ -f /tmp/ws-init.out ] && mv -f /tmp/ws-init.out /tmp/ws-init.`$(date -u +%Y%m%dT%H%M%SZ -r /tmp/ws-init.out).out; " +
-               "export INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_DNS_WIN='$DnsWin' INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
+               "export WS_STATUS=1 INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_DNS_WIN='$DnsWin' INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
                "else WS_URL='$WsUrl' bash /tmp/ws-init.sh --apply 2>&1 | tee /tmp/ws-init.out; fi; rc=`$?; rm -f /tmp/ws-init.sh; echo `$rc > /tmp/ws-init.rc; " +
                "if [ `$rc != 0 ]; then echo; echo 'init.sh FAILED (rc='`$rc') -- see the FAIL line above; press Enter to close'; read x; fi; exit `$rc"
         Step "INIT: init.sh --apply as root in a NEW Ubuntu window ($($script:D)) -- type the password for WSL user '$User' there, then watch apt / git clone / sign-in"
@@ -808,7 +816,7 @@ function FixWslNet {
     $null = DistroVer
     if (NetOk) { Emit 'WSLNET' "did .wslconfig [wsl2] $desc + wsl --shutdown; net ok"; $script:netOk = $true; return }
     # not fatal: init.sh's NET step reports it again before apt
-    Emit 'WSLNET' "WARN archive.ubuntu.com unreachable from WSL with [wsl2] $desc (Windows reaches it) -- check VPN / proxy"; $script:netOk = $true
+    Emit 'WSLNET' "WARN archive.ubuntu.com unreachable from WSL with [wsl2] $desc (Windows reaches it) -- not on CorpNet? connect the corp VPN, then run the same command again"; $script:netOk = $true
 }
 $distroUp = [bool](Distros | Where-Object { $_.name -eq $script:D })
 if (-not $Apply) {
@@ -868,6 +876,7 @@ if ($r -eq 'OK') {
         $line = (@(@($out) | Where-Object { $_ -match '^SMOKE ' } | Select-Object -Last 1) -join '') -replace '^SMOKE ', ''
         if (-not $line) { $line = "FAIL no SMOKE line rc=$($script:rc)" }
         $script:smokeLine = "SMOKE $line"
+        Status "SMOKE $line"
         if ($line -like 'ok*') { Emit 'SMOKE' $line } else { Emit 'SMOKE' "$line (re-run: wsl -u root, cd /workspace, bin/smoke-addup.sh)" }
     }
 }
