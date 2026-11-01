@@ -236,6 +236,11 @@ Emit 'ADMIN' $(if ($isAdmin) { 'ok' } else { 'NO (installs of WSL / a distro nee
 # engine, the Windows features (VirtualMachinePlatform) and the distro, as WSL2 (the default).  A first install
 # asks for a Windows reboot: say so and stop; the re-run after the reboot finds it and moves on.
 $script:D = $(if ($Distro) { $Distro } else { $NewDistro })
+# pins used by the WSL fallbacks below (were defined further down, in NODE: empty here -> Get-FileHash on the bare
+# %LOCALAPPDATA%\ws-bootstrap\ dir, field 2026-11-01 on a box with the engine but no distro)
+$WslMsi = 'https://github.com/microsoft/WSL/releases/download/2.7.14/wsl.2.7.14.0.x64.msi'   # = fleet c17 `wsl --version`; plain release URL, no API
+$DistroImg = 'https://releases.ubuntu.com/26.04.1/ubuntu-26.04.1-wsl-amd64.wsl'   # = microsoft/WSL DistributionInfo.json Ubuntu-26.04
+$DistroSha = '48D56724B5C8E60F24893E83E73BBB58C60B3CA22FBA3DA977075420ACD54104'
 function HaveDistro { [bool](Distros | Where-Object { $_.name -eq $script:D }) }
 function DistroVer { Step "WSL: start $($script:D) (first start can take a minute)"
     (Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', '. /etc/os-release; echo $ID $VERSION_ID') -Timeout 90 | Select-Object -Last 1) }
@@ -416,9 +421,6 @@ else {
 # present at bootstrap time is gone by stage 6 / the next day.  So: require major >= $NodeMin, pin a current
 # LTS (= the version the fleet was repaired to), and upgrade an older one in place (MSI major upgrade).
 $NodeMin = 24
-$WslMsi = 'https://github.com/microsoft/WSL/releases/download/2.7.14/wsl.2.7.14.0.x64.msi'   # = fleet c17 `wsl --version`; plain release URL, no API
-$DistroImg = 'https://releases.ubuntu.com/26.04.1/ubuntu-26.04.1-wsl-amd64.wsl'   # = microsoft/WSL DistributionInfo.json Ubuntu-26.04
-$DistroSha = '48D56724B5C8E60F24893E83E73BBB58C60B3CA22FBA3DA977075420ACD54104'
 $NodePin = 'https://nodejs.org/dist/v24.22.1/node-v24.22.1-x64.msi'
 $NodeExe = "$env:ProgramFiles\nodejs\node.exe"
 function NodeVer { if (Test-Path -LiteralPath $NodeExe) { "$((& $NodeExe --version 2>$null) -join '')".Trim() } else { '' } }
