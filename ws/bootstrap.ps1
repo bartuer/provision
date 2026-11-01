@@ -681,14 +681,14 @@ function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding man
     # init.sh goes over STDIN: its base64 (~33 KB) on the command line exceeds the 32767-char Windows limit
     # ("The filename or extension is too long" -- init.sh then never starts).  Only short commands go on argv.
     $null = ($b64 | & wsl.exe -d $script:D -u root -e sh -c "tr -d '\r\n' | base64 -d > /tmp/ws-init.sh" 2>&1)
-    $cmd = "INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_DNS_WIN='$DnsWin' INIT_USER='$User' WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode; rc=`$?; rm -f /tmp/ws-init.sh; exit `$rc"
+    $cmd = "INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_DNS_WIN='$DnsWin' INIT_PROXY='$script:WsProxy' INIT_USER='$User' WS_URL='$WsUrl' bash /tmp/ws-init.sh $mode; rc=`$?; rm -f /tmp/ws-init.sh; exit `$rc"
     $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     if ($mode -eq '--apply') {   # long (apt, clone + ADO auth, lfs, install.sh): run in its OWN Ubuntu window = a real tty,
         # so apt / git clone / lfs draw their native progress and a credential prompt can be answered there.
         # `script` keeps the pty AND logs to /tmp/ws-init.out; this window shows a progress bar + the last log line.
         $ErrorActionPreference = $old
         $run = "echo `$`$ > /tmp/ws-init.pid; [ -f /tmp/ws-init.out ] && mv -f /tmp/ws-init.out /tmp/ws-init.`$(date -u +%Y%m%dT%H%M%SZ -r /tmp/ws-init.out).out; " +
-               "export WS_STATUS=1 INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_DNS_WIN='$DnsWin' INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
+               "export WS_STATUS=1 INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_DNS_WIN='$DnsWin' INIT_PROXY='$script:WsProxy' INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
                "else WS_URL='$WsUrl' bash /tmp/ws-init.sh --apply 2>&1 | tee /tmp/ws-init.out; fi; rc=`$?; rm -f /tmp/ws-init.sh; echo `$rc > /tmp/ws-init.rc; " +
                "if [ `$rc != 0 ]; then echo; echo 'init.sh FAILED (rc='`$rc') -- see the FAIL line above; press Enter to close'; read x; fi; exit `$rc"
         Step "INIT: init.sh --apply as root in a NEW Ubuntu window ($($script:D)) -- type the password for WSL user '$User' there, then watch apt / git clone / sign-in"
@@ -784,6 +784,42 @@ function WslCfgSet($want) {   # CLEAN: .wslconfig becomes exactly the fleet file
     [IO.File]::WriteAllLines($f, [string[]]$out)   # no BOM: WSL ignores a .wslconfig that starts with one
     return $true
 }
+$script:WsProxy = ''
+function WsProxyUp {   # node relay on Windows loopback (mirrored WSL shares it); $true when WSL reaches archive through it
+    if (-not (HaveNode)) { Write-Host "  WSLNET: no Windows node.exe for the proxy"; return $false }
+    $dir = Join-Path $env:LOCALAPPDATA 'ws-bootstrap'; New-Item -ItemType Directory -Force $dir | Out-Null
+    $js = Join-Path $dir 'ws-proxy.js'
+    [IO.File]::WriteAllText($js, @'
+// ws-proxy: HTTP + CONNECT relay on 127.0.0.1:3128 for WSL when only Windows processes reach the network (GSA)
+const http = require('http'), net = require('net');
+const s = http.createServer((q, r) => {
+  let u; try { u = new URL(q.url); } catch { r.writeHead(400); return r.end(); }
+  const p = http.request({ host: u.hostname, port: u.port || 80, path: u.pathname + u.search, method: q.method, headers: q.headers },
+    x => { r.writeHead(x.statusCode, x.headers); x.pipe(r); });
+  p.on('error', () => { if (!r.headersSent) r.writeHead(502); r.end(); }); q.pipe(p);
+});
+s.on('connect', (q, c, hd) => {
+  const i = q.url.lastIndexOf(':'), h = q.url.slice(0, i), pt = +q.url.slice(i + 1) || 443;
+  const t = net.connect(pt, h, () => { c.write('HTTP/1.1 200 OK\r\n\r\n'); t.write(hd); t.pipe(c); c.pipe(t); });
+  t.on('error', () => c.destroy()); c.on('error', () => t.destroy());
+});
+s.on('error', e => { console.error(e.message); process.exit(e.code === 'EADDRINUSE' ? 0 : 1); });
+s.listen(3128, '127.0.0.1');
+'@)
+    $arg = "-NoProfile -WindowStyle Hidden -Command `"& '$NodeExe' '$js'`""
+    try {
+        $a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
+        $t = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+        $st = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName 'ws-proxy' -Action $a -Trigger $t -Settings $st -Force | Out-Null
+        Start-ScheduledTask -TaskName 'ws-proxy'
+    } catch { Write-Host "  WSLNET: logon task failed ($($_.Exception.Message)); starting the proxy for this session only"
+              Start-Process -FilePath $NodeExe -ArgumentList "`"$js`"" -WindowStyle Hidden | Out-Null }
+    Start-Sleep -Seconds 3
+    $o = InDistro 'curl -x http://127.0.0.1:3128 -s -m 10 -o /dev/null -w %{http_code} http://archive.ubuntu.com/ubuntu/'
+    if ("$o" -match '200|30\d') { $script:WsProxy = 'http://127.0.0.1:3128'; return $true }
+    Write-Host "  WSLNET: proxy test from WSL gave '$o'"; return $false
+}
 function FixWslNet {
     $desc = ($DevWslCfg.Keys | ForEach-Object { "$_=$($DevWslCfg[$_])" }) -join ' '
     $net = NetOk
@@ -826,6 +862,11 @@ function FixWslNet {
         $null = DistroVer
         if (NetOk) { Emit 'WSLNET' "did .wslconfig [wsl2] $desc + wsl --shutdown; net ok (NAT blocked here; back on CorpNet re-run this bootstrap -> NAT)"; $script:netOk = $true; return }
     }
+    # NAT and mirrored both dead but Windows itself is online (Global Secure Access tunnels Windows processes, drops
+    # WSL packets; disabling GSA = no network at all -- field laptop 2026-11-01).  MEASURED there: a node proxy on
+    # Windows 127.0.0.1:3128 -> WSL curl -x archive.ubuntu.com 200, github.com 200.  So run one (logon task, kept
+    # across reboots) and hand INIT_PROXY to init.sh, which points apt / git / curl / dockerd at it.
+    if ($DevWslCfg['networkingMode'] -eq 'mirrored' -and (WsProxyUp)) { Emit 'WSLNET' "did WSL -> Windows proxy $script:WsProxy (WSL direct net blocked, e.g. Global Secure Access off CorpNet)"; $script:netOk = $true; return }
     # not fatal: init.sh's NET step reports it again before apt
     Emit 'WSLNET' "WARN archive.ubuntu.com unreachable from WSL with NAT and mirrored -- check Windows itself reaches it (curl.exe -sI http://archive.ubuntu.com); if not, connect the corp VPN, then run the same command again"; $script:netOk = $true
 }

@@ -135,11 +135,25 @@ net_do() {
   printf 'Acquire::ForceIPv4 "true";\n' > /etc/apt/apt.conf.d/99ws-ipv4
   net_probe -4
 }
+proxy_do() {   # INIT_PROXY = node relay on Windows loopback (bootstrap WsProxyUp; mirrored WSL shares 127.0.0.1)
+  local P="$INIT_PROXY" N="localhost,127.0.0.1,::1,.local,.internal"
+  printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "$P" "$P" > /etc/apt/apt.conf.d/99ws-proxy
+  printf 'export http_proxy=%s https_proxy=%s HTTP_PROXY=%s HTTPS_PROXY=%s no_proxy=%s NO_PROXY=%s\n' "$P" "$P" "$P" "$P" "$N" "$N" > /etc/profile.d/ws-proxy.sh
+  printf 'Defaults env_keep += "http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY"\n' > /etc/sudoers.d/ws-proxy; chmod 440 /etc/sudoers.d/ws-proxy
+  mkdir -p /etc/systemd/system/docker.service.d
+  printf '[Service]\nEnvironment="HTTP_PROXY=%s" "HTTPS_PROXY=%s" "NO_PROXY=%s"\n' "$P" "$P" "$N" > /etc/systemd/system/docker.service.d/ws-proxy.conf
+  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
+  export http_proxy="$P" https_proxy="$P" HTTP_PROXY="$P" HTTPS_PROXY="$P" no_proxy="$N" NO_PROXY="$N"
+  curl -sS -m 10 -o /dev/null http://archive.ubuntu.com/ubuntu/ 2>>/tmp/ws-net.err
+}
+[ -f /etc/profile.d/ws-proxy.sh ] && [ -z "${INIT_PROXY:-}" ] && . /etc/profile.d/ws-proxy.sh   # a re-run keeps the route
 : > /tmp/ws-net.err
 if ! dns_ok; then say NET "skip (DNS not fixed yet)"
 elif command -v curl >/dev/null 2>&1 && net_probe -6; then say NET "ok (IPv6)"
 elif net_probe -4; then
   if [ -f /etc/apt/apt.conf.d/99ws-ipv4 ]; then say NET "ok (IPv4, apt pinned)"; else act NET "pin apt to IPv4 (IPv6 unreachable)" net_do || finish; fi
+elif [ -n "${INIT_PROXY:-}" ] && timeout 12 curl -x "$INIT_PROXY" -sS -m 10 -o /dev/null http://archive.ubuntu.com/ubuntu/ 2>>/tmp/ws-net.err; then
+  act NET "route apt / git / curl / dockerd via the Windows proxy $INIT_PROXY (WSL direct net blocked, e.g. Global Secure Access)" proxy_do || finish
 else
   bad NET "archive.ubuntu.com:80 unreachable ($(tail -1 /tmp/ws-net.err 2>/dev/null)) -- run the Windows bootstrap again: it retries WSL in NAT and in mirrored mode; if Windows cannot reach it either, connect the corp VPN"; finish
 fi
