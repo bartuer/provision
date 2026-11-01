@@ -139,12 +139,13 @@ net_do() {
 proxy_do() {   # INIT_PROXY = node relay on Windows loopback (bootstrap WsProxyUp; mirrored WSL shares 127.0.0.1)
   local P="$INIT_PROXY" N="localhost,127.0.0.1,::1,.local,.internal"
   printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "$P" "$P" > /etc/apt/apt.conf.d/99ws-proxy
-  printf 'export http_proxy=%s https_proxy=%s HTTP_PROXY=%s HTTPS_PROXY=%s no_proxy=%s NO_PROXY=%s\n' "$P" "$P" "$P" "$P" "$N" "$N" > /etc/profile.d/ws-proxy.sh
+  # NODE_USE_ENV_PROXY=1: node 24 fetch() ignores HTTPS_PROXY without it (lserver/wserver LLM calls died behind GSA)
+  printf 'export http_proxy=%s https_proxy=%s HTTP_PROXY=%s HTTPS_PROXY=%s no_proxy=%s NO_PROXY=%s NODE_USE_ENV_PROXY=1\n' "$P" "$P" "$P" "$P" "$N" "$N" > /etc/profile.d/ws-proxy.sh
   printf 'Defaults env_keep += "http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY"\n' > /etc/sudoers.d/ws-proxy; chmod 440 /etc/sudoers.d/ws-proxy
   mkdir -p /etc/systemd/system/docker.service.d
   printf '[Service]\nEnvironment="HTTP_PROXY=%s" "HTTPS_PROXY=%s" "NO_PROXY=%s"\n' "$P" "$P" "$N" > /etc/systemd/system/docker.service.d/ws-proxy.conf
   command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
-  export http_proxy="$P" https_proxy="$P" HTTP_PROXY="$P" HTTPS_PROXY="$P" no_proxy="$N" NO_PROXY="$N"
+  export http_proxy="$P" https_proxy="$P" HTTP_PROXY="$P" HTTPS_PROXY="$P" no_proxy="$N" NO_PROXY="$N" NODE_USE_ENV_PROXY=1
   curl -sS -m 10 -o /dev/null http://archive.ubuntu.com/ubuntu/ 2>>/tmp/ws-net.err
 }
 [ -f /etc/profile.d/ws-proxy.sh ] && [ -z "${INIT_PROXY:-}" ] && . /etc/profile.d/ws-proxy.sh   # a re-run keeps the route
