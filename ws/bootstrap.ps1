@@ -173,7 +173,9 @@ function InDistro([string]$cmd) { return Native 'wsl.exe' @('-d', $script:D, '-u
 function Status([string]$line) {
     if (-not $Apply -or -not $script:D) { return }
     $l = ($line -replace "[`r`n']", ' '); if ($l.Length -gt 400) { $l = $l.Substring(0, 400) }
-    $null = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', "[ -x /workspace/bin/install-report.sh ] && cd /workspace && bin/install-report.sh --status '$l'") -Timeout 200 -Tag 'status'
+    # fire-and-forget (field 2026-11-01: a push via the GSA relay blocked here 170 s before the CLI window); flock serializes
+    $sa = @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', "[ -x /workspace/bin/install-report.sh ] && cd /workspace && flock /tmp/ws-status.lock timeout 200 bin/install-report.sh --status '$l' >/dev/null 2>&1")
+    try { Start-Process -FilePath 'wsl.exe' -WindowStyle Hidden -ArgumentList ((@($sa) | ForEach-Object { Q $_ }) -join ' ') | Out-Null } catch { }
 }
 
 # WIN: the Windows half of install (install.ps1: WV2 tree, PIN, SHIM, WEF, ASR, SSH, DOCKER, VMBOOT).  It needs
@@ -908,23 +910,26 @@ Emit 'NODEPATH' "win=$(if ($NodeWin) { $NodeWin } else { 'NOT FOUND' })"
 if ($r -eq 'OK') {
     Emit 'INIT' "ok init.sh --apply in $($script:D)"
     WinTier
-    BenchReady
+    # CLI FIRST (field 2026-11-01: BENCH waited 200 s per stage on a hung status push, the user saw no window and gave up).
+    # init.sh RESULT=OK means stage 9 left officeagent-dev running; open the CLI now, bench + smoke run after it.
+    $script:ctrUp = ((@(InDistro 'docker inspect -f {{.State.Running}} officeagent-dev 2>/dev/null') -join '') -match 'true')
     # Land the user in GHCP CLI inside the bench container, in its OWN window (init.sh runs install.sh with WS_CLI=0:
     # a TUI inside the init window filled /tmp/ws-init.out with binary and replaced the window).  $env:WS_CLI=0 skips.
-    # BENCH FAIL -> a plain WSL root shell in /workspace instead (fix, then ./install.sh 10 opens the CLI itself).
+    # container down -> a plain WSL root shell in /workspace instead (fix, then ./install.sh 10 opens the CLI itself).
     if ($env:WS_CLI -ne '0') {
         $path = (Get-Command wsl.exe).Source
-        if ($script:benchOk) { $title = 'GHCP CLI (officeagent-dev)'
+        if ($script:ctrUp) { $title = 'GHCP CLI (officeagent-dev)'
             $cli = @('-d', $script:D, '-u', 'root', '-e', 'docker', 'exec', '-it', '-w', '/workspace', 'officeagent-dev', 'bash', '-ic', 't main || echo "GHCP CLI exited rc=$? -- staying in the container shell (t = copilot in tmux, h = pick model, ec = emacs)" && exec bash -i') }
-        else { $title = 'WSL /workspace (BENCH FAIL)'
-            $cli = @('-d', $script:D, '-u', 'root', '--cd', '/workspace', '-e', 'bash', '-c', 'echo "BENCH FAIL -- fix the rows below, then ./install.sh 10 (opens GHCP CLI)" && bin/bench-ctxcore.sh --check && exec bash -i || exec bash -i') }
+        else { $title = 'WSL /workspace (container down)'
+            $cli = @('-d', $script:D, '-u', 'root', '--cd', '/workspace', '-e', 'bash', '-c', 'echo "officeagent-dev is not running -- ./install.sh 2 9 10 (opens GHCP CLI)" && bin/bench-ctxcore.sh --check && exec bash -i || exec bash -i') }
         # NO ';' in $cli: wt.exe splits its command line on ';' (a 2nd tab ran 'exec' -> 'cannot find the file specified')
         $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
         if ($wt -and $env:WS_WT -ne '0') { Start-Process -FilePath $wt.Source -ArgumentList ((@('-w', 'new', 'new-tab', '--title', $title, $path) + $cli | ForEach-Object { Q $_ }) -join ' ') }
         else { Start-Process -FilePath $path -ArgumentList (($cli | ForEach-Object { Q $_ }) -join ' ') }
-        if (-not $script:benchOk) { Emit 'CLI' "NOT opened (BENCH FAIL) -- opened a WSL shell in /workspace; fix, then ./install.sh 10" }
+        if (-not $script:ctrUp) { Emit 'CLI' "NOT opened (officeagent-dev down) -- opened a WSL shell in /workspace; fix, then ./install.sh 10" }
         else { Emit 'CLI' "opened GHCP CLI in officeagent-dev:/workspace (new window; tmux 'main', detach C-b d). Later: wsl, then docker exec -it officeagent-dev bash -> t / h / ec" }
     }
+    BenchReady
     # SMOKE: one real turn through wserver (Excel + our pane -> aserver): new sheet Numbers 1..10, A11 = sum (55).
     # The Excel window is LEFT OPEN for the user; the next smoke closes only windows it kept itself.
     # $env:WS_SMOKE=0 skips.  bin/smoke-addup.sh settles the pane first (the NAA relay reloads it once ~10 s in).
