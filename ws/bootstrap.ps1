@@ -838,6 +838,9 @@ function FixWslNet {
     }
     $changed = WslCfgSet $DevWslCfg   # always NAT; takes effect on the next VM start
     if ($net) { Emit 'WSLNET' ("ok net; .wslconfig {0}" -f $(if ($changed) { "set to [wsl2] $desc (applies on next WSL start; no restart now)" } else { "already [wsl2] $desc" })); $script:netOk = $true; return }
+    # a RE-RUN on a proxy box (GSA off CorpNet): direct net is broken by design and containers run -> the proxy
+    # route is the answer, never a restart (field laptop 2026-11-01: REFUSE here blocked the container-bridge re-run)
+    if ($DevWslCfg['networkingMode'] -eq 'mirrored' -and (WsProxyUp)) { Emit 'WSLNET' "ok WSL -> Windows proxy $script:WsProxy (direct net blocked, e.g. Global Secure Access off CorpNet; no restart)"; $script:netOk = $true; return }
     $busy = @()
     foreach ($d in @(Distros | Where-Object { $_.state -eq 'Running' })) {
         $busy += @(Native 'wsl.exe' @('-d', $d.name, '-u', 'root', '-e', 'sh', '-c', 'command -v docker >/dev/null && docker ps -q 2>/dev/null; command -v tmux >/dev/null && tmux ls 2>/dev/null') -Timeout 30 | Where-Object { $_ -match '\S' })
