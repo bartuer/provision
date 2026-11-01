@@ -801,16 +801,19 @@ const s = http.createServer((q, r) => {
 s.on('connect', (q, c, hd) => {
   const i = q.url.lastIndexOf(':'), h = q.url.slice(0, i), pt = +q.url.slice(i + 1) || 443;
   const t = net.connect(pt, h, () => { c.write('HTTP/1.1 200 OK\r\n\r\n'); t.write(hd); t.pipe(c); c.pipe(t); });
-  t.on('error', () => c.destroy()); c.on('error', () => t.destroy());
+  t.setTimeout(30000, () => { if (t.connecting) t.destroy(); });  // connect timeout only; tunnels may idle
+  t.on('error', () => c.destroy()); c.on('error', () => t.destroy()); t.on('close', () => c.destroy()); c.on('close', () => t.destroy());
 });
+process.on('uncaughtException', e => console.error('ws-proxy:', e && e.message));  // one bad socket must not kill WSL's only route out
 s.on('error', e => { console.error(e.message); process.exit(e.code === 'EADDRINUSE' ? 0 : 1); });
 s.listen(3128, '127.0.0.1');
 '@)
-    $arg = "-NoProfile -WindowStyle Hidden -Command `"& '$NodeExe' '$js'`""
+    # supervise loop: node exits (crash, EADDRINUSE) -> retry in 5 s; the task itself also restarts on failure
+    $arg = "-NoProfile -WindowStyle Hidden -Command `"while (`$true) { & '$NodeExe' '$js'; Start-Sleep 5 }`""
     try {
         $a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
         $t = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
-        $st = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        $st = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
         Register-ScheduledTask -TaskName 'ws-proxy' -Action $a -Trigger $t -Settings $st -Force | Out-Null
         Start-ScheduledTask -TaskName 'ws-proxy'
     } catch { Write-Host "  WSLNET: logon task failed ($($_.Exception.Message)); starting the proxy for this session only"
