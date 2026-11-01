@@ -21,6 +21,7 @@ WS_DIR="${WS_DIR:-/workspace}"
 APPLY="${INIT_APPLY:-0}"
 MNT="${INIT_MNT:-/mnt/c}"
 PKGS="git git-lfs docker.io ca-certificates curl jq"
+{ [ -n "${INIT_PROXY:-}" ] || [ -f /etc/profile.d/ws-proxy.sh ]; } && PKGS="$PKGS socat"   # PROXYBR: containers -> Windows proxy
 for a in "$@"; do
   case "$a" in
     --apply) APPLY=1 ;;
@@ -256,6 +257,25 @@ elif is_wsl; then
     say DOCKERD "RESTART NEEDED -- dockerd did not start ($(tail -1 /var/log/dockerd.log 2>/dev/null | cut -c1-160)); from Windows: wsl --terminate ${WSL_DISTRO_NAME:-<distro>}, then re-run"; fi
 else
   say DOCKERD "WARN no docker server, no systemd, not WSL -- start dockerd yourself"
+fi
+
+# PROXYBR -- behind the Windows proxy (GSA off CorpNet: NAT and mirrored both blocked) a CONTAINER has no route out:
+# 127.0.0.1:3128 is the WSL/Windows loopback, not the container's.  socat on the docker bridge gateway
+# (host.docker.internal = host-gateway) :3129 -> 127.0.0.1:3128; install.sh hands containers http_proxy to it.
+# (laptop 11-01: tdnf in officeagent-dev hung 45 min at stage 2.)
+PROXYBR_UNIT=/etc/systemd/system/ws-proxy-bridge.service
+proxybr_ok() { systemctl is-active -q ws-proxy-bridge.service 2>/dev/null; }
+proxybr_do() {
+  printf '%s\n' '[Unit]' 'Description=docker bridge :3129 -> Windows proxy 127.0.0.1:3128 (workspace init.sh PROXYBR)' \
+    'After=docker.service' 'Requires=docker.service' '[Service]' \
+    "ExecStart=/bin/sh -c 'exec socat TCP-LISTEN:3129,bind=\$(docker network inspect bridge -f \"{{(index .IPAM.Config 0).Gateway}}\"),reuseaddr,fork TCP:127.0.0.1:3128'" \
+    'Restart=always' 'RestartSec=5' '[Install]' 'WantedBy=multi-user.target' > "$PROXYBR_UNIT"
+  systemctl daemon-reload && systemctl enable -q --now ws-proxy-bridge.service && sleep 1 && proxybr_ok
+}
+if [ -f /etc/profile.d/ws-proxy.sh ] || [ -n "${INIT_PROXY:-}" ]; then
+  if proxybr_ok; then say PROXYBR ok
+  elif ! has_systemd; then say PROXYBR "WARN no systemd -- containers get no proxy (re-run after the distro restarts)"
+  else act PROXYBR "socat docker-bridge:3129 -> Windows proxy 127.0.0.1:3128 (ws-proxy-bridge.service), so containers reach the network" proxybr_do; fi
 fi
 
 # GCM
