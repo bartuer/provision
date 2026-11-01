@@ -494,16 +494,27 @@ sub_missing() {
 SUB_WHAT="$([ "${INIT_SUBMODULES:-0}" = 1 ] && echo "git submodule update $SUB_ARGS" || echo "git submodule update $SUB_ARGS ssg_agent")"
 # UPDATE: an existing clone is fast-forwarded to origin first -- otherwise a re-run resumes the LFS objects of an
 # OLD commit (measured 2026-10-19: a devbox clone from before 48b3021 downloaded the retired alserver.tar.gz.XX
-# parts instead of the alserver.NN shards).  Only a clean tree is moved; local commits/edits -> WARN, left alone.
+# parts instead of the alserver.NN shards).  Local edits ride along (autostash); local commits -> WARN, left alone.
 update_do() {
   GIT_TERMINAL_PROMPT=0 git -C "$WS_DIR" fetch --quiet origin || { echo "UPDATE: git fetch failed"; return 1; }
   local up; up="$(git -C "$WS_DIR" rev-parse --abbrev-ref '@{u}' 2>/dev/null)" || { echo "UPDATE: no upstream branch -- left alone"; return 0; }
   local h u; h="$(git -C "$WS_DIR" rev-parse HEAD)"; u="$(git -C "$WS_DIR" rev-parse "$up")"
   [ "$h" = "$u" ] && { echo "UPDATE: at $up ${h:0:7}"; return 0; }
-  if [ -n "$(git -C "$WS_DIR" status --porcelain --untracked-files=no)" ]; then
-    echo "UPDATE: WARN local edits -- not moving ${h:0:7} to $up ${u:0:7}"; return 0; fi
-  GIT_LFS_SKIP_SMUDGE=1 git -C "$WS_DIR" merge --ff-only --quiet "$up" \
-    || { echo "UPDATE: WARN ${h:0:7} cannot fast-forward to $up ${u:0:7} -- left alone"; return 0; }
+  # local edits (field laptop 2026-11-01: a dirty tree kept an install.sh from before the container-proxy fix, and the
+  # hand `git pull` refused too) -> stash, move, re-apply.  If an edit conflicts with origin, ORIGIN WINS (the
+  # installer must be the published one) and the edits stay in the stash -- never conflict markers in install.sh.
+  # Dirty submodule CONTENT is not an edit of this repo (--ignore-submodules=dirty).
+  local g="git -C $WS_DIR" dirty st=0
+  dirty="$($g status --porcelain --untracked-files=no --ignore-submodules=dirty | head -5 | tr '\n' ' ')"
+  if [ -n "$dirty" ]; then $g stash push -q -m "ws-init UPDATE $(date -u +%FT%TZ)" || { echo "UPDATE: WARN stash failed -- left alone"; return 0; }; st=1; fi
+  if ! GIT_LFS_SKIP_SMUDGE=1 $g merge --ff-only --quiet "$up"; then
+    [ $st = 1 ] && $g stash pop -q
+    echo "UPDATE: WARN ${h:0:7} cannot fast-forward to $up ${u:0:7} (local commits?) -- left alone: git -C $WS_DIR status"; return 0
+  fi
+  if [ $st = 1 ]; then
+    if $g stash apply -q >/dev/null 2>&1; then $g stash drop -q; echo "UPDATE: local edits re-applied: $dirty"
+    else $g reset -q --hard HEAD; echo "UPDATE: WARN local edits conflict with $up -- origin kept, edits saved: git -C $WS_DIR stash show -p stash@{0} ($dirty)"; fi
+  fi
   echo "UPDATE: ${h:0:7} -> ${u:0:7} ($up)"
 }
 lfs_missing() {   # LFS files whose content is not in the working tree yet ("-" = pointer only)
