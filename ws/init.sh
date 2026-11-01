@@ -329,7 +329,7 @@ sub_do() {   # ssg_agent carries ~250 MB of LFS (archive/*.tar.gz): the checkout
   [ "${INIT_SKIP_LFS:-0}" = 1 ] && return 0
   git -C "$WS_DIR" submodule foreach --quiet 'git config lfs.concurrenttransfers '"$LFS_JOBS"' && git lfs pull && echo "LFS $sm_path: $(git lfs ls-files | wc -l) objects"'
 }
-LFS_JOBS="${INIT_LFS_JOBS:-16}"   # parallel LFS downloads (126 MB parts; one stream is ~4 MB/s)
+LFS_JOBS="${INIT_LFS_JOBS:-$( [ -n "${https_proxy:-}" ] && echo 4 || echo 16)}"   # 4 behind the Windows proxy: 16 streams via GSA sat at 0 B (laptop 11-01); 126 MB parts, one stream ~4 MB/s
 lfs_do() {   # foreground, so its meter owns the tty: "Downloading LFS objects: 45% (35/78), 2.7 GB | 40 MB/s"
   [ "${INIT_SKIP_LFS:-0}" = 1 ] && return 0
   git -C "$WS_DIR" config lfs.concurrenttransfers "$LFS_JOBS" || return 1
@@ -343,7 +343,7 @@ lfs_do() {   # foreground, so its meter owns the tty: "Downloading LFS objects: 
   local n tot; n="$(grep -c . "$map")"
   tot="$(awk -F'\t' '{split($3,a," "); m=(a[2]=="GB")?1024:(a[2]=="KB")?1/1024:(a[2]=="B")?1/1048576:1; t+=a[1]*m} END {printf "%.1f GB", t/1024}' "$map")"
   echo "LFS: $n objects, $tot, $LFS_JOBS downloads in parallel (git's meter: /tmp/ws-lfs.err)"
-  export LFS_T0 LFS_G0; LFS_T0="$(date +%s)"; LFS_G0="$(du -sb "$WS_DIR/.git/lfs/objects" 2>/dev/null | cut -f1)"
+  export LFS_T0 LFS_G0; LFS_T0="$(date +%s)"; LFS_G0="$(du -sb "$WS_DIR/.git/lfs" 2>/dev/null | cut -f1)"
   : >/tmp/ws-lfs.err
   lfs_watch "$WS_DIR" "$map" "$n" & local w=$!
   # STALL guard (measured 2026-10-19: a devbox sat at 91/115 for 30+ min while c17 pulls all 115 in 119s):
@@ -355,7 +355,7 @@ lfs_do() {   # foreground, so its meter owns the tty: "Downloading LFS objects: 
     local last=-1 still=0 now
     while kill -0 "$p" 2>/dev/null; do
       sleep 5
-      now="$(du -sb "$WS_DIR/.git/lfs/objects" "$WS_DIR/.git/lfs/incomplete" 2>/dev/null | awk '{t+=$1} END {print t+0}')"
+      now="$(du -sb "$WS_DIR/.git/lfs" 2>/dev/null | cut -f1)"   # whole lfs dir: in-flight bytes may sit in tmp/, not incomplete/
       if [ "$now" = "$last" ]; then still=$((still+5)); else still=0; last="$now"; fi
       if [ "$still" -ge "$stall" ]; then
         if [ "$try" -lt "$tries" ]; then echo "LFS: STALLED -- no bytes for ${stall}s; restarting git lfs pull (try $((try+1))/$tries, done files are kept)"
@@ -382,7 +382,7 @@ lfs_have() { find "$1/.git/lfs/objects" -type f -size +0 2>/dev/null | sed 's|.*
 lfs_status() {   # dir map n t0 [tag]: files done, GB, MB/s since t0, bytes in flight
   local d g f el
   d="$(lfs_have "$1" | grep -cFf - <(cut -f1 "$2"))"
-  g="$(du -sb "$1/.git/lfs/objects" 2>/dev/null | cut -f1)"; f="$(du -sb "$1/.git/lfs/incomplete" 2>/dev/null | cut -f1)"
+  g="$(du -sb "$1/.git/lfs" 2>/dev/null | cut -f1)"; f=0   # whole lfs dir (objects + incomplete + tmp)
   el=$(( $(date +%s) - $4 )); [ $el -lt 1 ] && el=1
   awk -v d="$d" -v n="$3" -v g="${g:-0}" -v f="${f:-0}" -v el="$el" -v tag="${5:-progress}" -v g0="${LFS_G0:-0}" \
     'BEGIN { printf "LFS %s: %d/%d files, %.2f GB, %.1f MB/s, %dm%02ds\n", tag, d, n, (g+f)/1073741824, (g+f-g0)/1048576/el, el/60, el%60 }'
