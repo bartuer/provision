@@ -141,7 +141,7 @@ elif command -v curl >/dev/null 2>&1 && net_probe -6; then say NET "ok (IPv6)"
 elif net_probe -4; then
   if [ -f /etc/apt/apt.conf.d/99ws-ipv4 ]; then say NET "ok (IPv4, apt pinned)"; else act NET "pin apt to IPv4 (IPv6 unreachable)" net_do || finish; fi
 else
-  bad NET "archive.ubuntu.com:80 unreachable ($(tail -1 /tmp/ws-net.err 2>/dev/null)) -- not on CorpNet? connect the corp VPN on Windows, then run the same command again (VPN up but still failing: VPN / proxy blocks WSL)"; finish
+  bad NET "archive.ubuntu.com:80 unreachable ($(tail -1 /tmp/ws-net.err 2>/dev/null)) -- run the Windows bootstrap again: it retries WSL in NAT and in mirrored mode; if Windows cannot reach it either, connect the corp VPN"; finish
 fi
 
 # APT

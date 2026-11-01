@@ -815,8 +815,19 @@ function FixWslNet {
     Start-Sleep -Seconds 8
     $null = DistroVer
     if (NetOk) { Emit 'WSLNET' "did .wslconfig [wsl2] $desc + wsl --shutdown; net ok"; $script:netOk = $true; return }
+    # the other mode: mirrored fails ON CorpNet (GSA, 2026-10-19) but NAT fails OFF CorpNet (field laptop 2026-11-01:
+    # Windows curl archive.ubuntu.com 200, WSL NAT connect timeout, VPN would not connect) -- so try mirrored before
+    # asking for VPN.  Back on CorpNet a re-run of this bootstrap flips it to NAT again (the branch above).
+    if ($DevWslCfg['networkingMode'] -eq 'nat' -and $env:WS_NET -ne 'nat') {
+        $DevWslCfg['networkingMode'] = 'mirrored'; $null = WslCfgSet $DevWslCfg; $desc = ($DevWslCfg.Keys | ForEach-Object { "$_=$($DevWslCfg[$_])" }) -join ' '
+        Step "WSLNET: NAT has no network either (off CorpNet?); trying [wsl2] $desc + wsl --shutdown"
+        Native 'wsl.exe' @('--shutdown') -Timeout 60 | Out-Null
+        Start-Sleep -Seconds 8
+        $null = DistroVer
+        if (NetOk) { Emit 'WSLNET' "did .wslconfig [wsl2] $desc + wsl --shutdown; net ok (NAT blocked here; back on CorpNet re-run this bootstrap -> NAT)"; $script:netOk = $true; return }
+    }
     # not fatal: init.sh's NET step reports it again before apt
-    Emit 'WSLNET' "WARN archive.ubuntu.com unreachable from WSL with [wsl2] $desc (Windows reaches it) -- not on CorpNet? connect the corp VPN, then run the same command again"; $script:netOk = $true
+    Emit 'WSLNET' "WARN archive.ubuntu.com unreachable from WSL with NAT and mirrored -- check Windows itself reaches it (curl.exe -sI http://archive.ubuntu.com); if not, connect the corp VPN, then run the same command again"; $script:netOk = $true
 }
 $distroUp = [bool](Distros | Where-Object { $_.name -eq $script:D })
 if (-not $Apply) {
