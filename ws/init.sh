@@ -399,7 +399,8 @@ lfs_do() {   # foreground, so its meter owns the tty: "Downloading LFS objects: 
   [ $rc = 0 ] || { echo "LFS: git lfs pull FAILED (rc=$rc):"; tr '\r' '\n' </tmp/ws-lfs.err | tail -20; }
   # DESKTOP-MTU7IN0 11-02: archive/wv2-*.00 left ' M' after a good pull (sha == oid, diff 0/0: stale index stat)
   # -> playbook 02 `git pull --rebase` refused.  Refresh the index stat once the content is in place.
-  [ $rc = 0 ] && git -C "$WS_DIR" update-index -q --refresh >/dev/null 2>&1
+  # (field 11-02: the real cause was no filter.lfs in the repo config -- refresh alone did not clear it)
+  [ $rc = 0 ] && { git -C "$WS_DIR" lfs install --local >/dev/null 2>&1; git -C "$WS_DIR" update-index -q --refresh >/dev/null 2>&1; }
   return $rc
 }
 lfs_have() { find "$1/.git/lfs/objects" -type f -size +0 2>/dev/null | sed 's|.*/||'; }   # oids already local
