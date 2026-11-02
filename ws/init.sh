@@ -354,7 +354,7 @@ LFS_JOBS="${INIT_LFS_JOBS:-$( [ -n "${https_proxy:-}" ] && echo 4 || echo 16)}" 
 lfs_do() {   # foreground, so its meter owns the tty: "Downloading LFS objects: 45% (35/78), 2.7 GB | 40 MB/s"
   [ "${INIT_SKIP_LFS:-0}" = 1 ] && return 0
   git -C "$WS_DIR" config lfs.concurrenttransfers "$LFS_JOBS" || return 1
-  # a local install-report commit + plain `git pull` = "divergent branches" abort (DESKTOP-7BM977C 10-30)
+  # a local commit + plain `git pull` = "divergent branches" abort (DESKTOP-7BM977C 10-30)
   git -C "$WS_DIR" config pull.rebase true
   # details: the object store is the truth (GIT_LFS_PROGRESS reports size -1 for ADO): a finished object lands in
   # .git/lfs/objects/<oid>, the one in flight grows in .git/lfs/incomplete.  lfs_watch prints one line per

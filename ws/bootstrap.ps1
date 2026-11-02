@@ -28,9 +28,6 @@
               recreates the CLI's container), then its --check clean.  WS_SKIP_BENCH=1 skips.
       SMOKE   after CLI (BENCH ok): bin/smoke-addup.sh = one ssg turn via wserver -- new sheet Numbers 1..10,
               A11 = SUM = 55; the Excel window stays open.  WS_SMOKE=0 skips.
-      REPORT  last, success or failure: bin/install-report.sh = install result, errors, stage times, network
-              (LFS + image pull MB/s), auth (GCM, tserver, kiss-auth), SMOKE -> redacted, committed under
-              fix.archive/install-reports/<host>-<UTC>/ and pushed.  WS_REPORT=0 skips.  Never fails the run.
     A distro restart (init.sh says RESTART_NEEDED: systemd was just enabled) is a separate gate
     done here automatically with `wsl --terminate <distro>` -- never `wsl --shutdown`.  It is refused (the
     command is printed for the user instead) when this script runs from inside WSL or when the distro has
@@ -172,16 +169,8 @@ function Distros {   # @{name=..; ver=..; default=$bool} from `wsl -l -v`
     return $r
 }
 # 120 s: field 11-02 wsl.exe clients took >30 s under load (WSAETIMEDOUT); a 30 s cut made `docker inspect officeagent-on`
-# read as "down" (CLI opened in the wrong container) and install-report.sh as "absent"
+# read as "down" (CLI opened in the wrong container)
 function InDistro([string]$cmd) { return Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', $cmd) -Timeout 120 }
-# plan 10 C.1: live uplink -- one status line to origin install/<host> (best effort; master untouched, no window)
-function Status([string]$line) {
-    if (-not $Apply -or -not $script:D) { return }
-    $l = ($line -replace "[`r`n']", ' '); if ($l.Length -gt 400) { $l = $l.Substring(0, 400) }
-    # fire-and-forget (field 2026-11-01: a push via the GSA relay blocked here 170 s before the CLI window); flock serializes
-    $sa = @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', "[ -x /workspace/bin/install-report.sh ] && cd /workspace && flock /tmp/ws-status.lock timeout 200 bin/install-report.sh --status '$l' >/dev/null 2>&1")
-    try { Start-Process -FilePath 'wsl.exe' -WindowStyle Hidden -ArgumentList ((@($sa) | ForEach-Object { Q $_ }) -join ' ') | Out-Null } catch { }
-}
 
 # WIN: the Windows half of install (install.ps1: WV2 tree, PIN, SHIM, WEF, ASR, SSH, DOCKER, VMBOOT).  It needs
 # admin, which this bootstrap already is; before 2026-10-21 a new box had to run it by hand and
@@ -222,7 +211,6 @@ function WinTier {
     $res = (@($out) | Where-Object { $_ -match '^RESULT=' } | Select-Object -Last 1) -replace '^RESULT=', ''
     $bad = @(@($out) | Where-Object { $_ -match '^[A-Z0-9_]+=(ABSENT|MISSING|FAIL|NO)' }) -join '; '
     if ($res -eq 'OK') { Emit 'WIN' 'ok install.ps1' } else { Emit 'WIN' "FAIL install.ps1 RESULT=$res $bad (re-run elevated: powershell -ExecutionPolicy Bypass -File $dst\install.ps1 -Distro $($script:D))" }
-    Status $(if ($res -eq 'OK') { 'WIN ok install.ps1' } else { "WIN FAIL install.ps1 RESULT=$res $bad" })
 }
 # BENCH = install.sh 10 (plan 02 E.2): the LAST install stage -- bench-ctxcore.sh --fix --make-lane-on, then its
 # --check (cihc grader at the OA pin, lane on :6030, wserver, win-* rows WIN just fixed) + CLI trusts /workspace.
@@ -231,10 +219,9 @@ function BenchReady {
     if ($env:WS_SKIP_BENCH -eq '1') { $script:benchOk = $true; Emit 'BENCH' 'skip (WS_SKIP_BENCH=1)'; return }
     Step "BENCH: install.sh 10 (bench-ctxcore.sh --fix --make-lane-on, then --check)"
     $keep = $(if ($script:cliCtr -eq 'officeagent-on') { 'WS_KEEP_ON=1 ' } else { '' })   # never rm the CLI's container
-    $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', "cd /workspace && ${keep}WS_CLI=0 WS_STATUS=1 ./install.sh 10") -Timeout 900 -Tag 'bench'
+    $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', "cd /workspace && ${keep}WS_CLI=0 ./install.sh 10") -Timeout 900 -Tag 'bench'
     $line = @(@($out) | Where-Object { $_ -match '^STAGE=10 ' } | Select-Object -Last 1) -join ''
     $script:benchOk = ($script:rc -eq 0)
-    Status "BENCH $(if ($script:benchOk) { 'ok' } elseif ($script:rc -eq 1460) { 'PENDING timeout 900s' } else { 'FAIL' }) $line"
     if ($script:benchOk) { Emit 'BENCH' "ok $line"; return }
     if ($script:rc -eq 1460) { Emit 'BENCH' "PENDING watch timed out after 900s, install.sh 10 may still run in WSL (check: wsl -u root, cd /workspace, ./install.sh --check 10)"; return }
     Emit 'BENCH' "FAIL $line (re-run: wsl -u root, cd /workspace, ./install.sh 10 -- detail: bin/bench-ctxcore.sh --check)"
@@ -706,7 +693,7 @@ function RunInit([string]$mode) {   # init.sh via base64 (no CRLF / encoding man
         # `script` keeps the pty AND logs to /tmp/ws-init.out; this window shows a progress bar + the last log line.
         $ErrorActionPreference = $old
         $run = "echo `$`$ > /tmp/ws-init.pid; [ -f /tmp/ws-init.out ] && mv -f /tmp/ws-init.out /tmp/ws-init.`$(date -u +%Y%m%dT%H%M%SZ -r /tmp/ws-init.out).out; " +
-               "export WS_STATUS=1 INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_DNS_WIN='$DnsWin' INIT_PROXY='$script:WsProxy' INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
+               "export INIT_GCM_WIN='$GcmWin' INIT_GIT_WIN='$GitWin' INIT_NODE_WIN='$NodeWin' INIT_DNS_WIN='$DnsWin' INIT_PROXY='$script:WsProxy' INIT_USER='$User'; if command -v script >/dev/null; then WS_URL='$WsUrl' script -qefc 'bash /tmp/ws-init.sh --apply' /tmp/ws-init.out; " +
                "else WS_URL='$WsUrl' bash /tmp/ws-init.sh --apply 2>&1 | tee /tmp/ws-init.out; fi; rc=`$?; rm -f /tmp/ws-init.sh; echo `$rc > /tmp/ws-init.rc; " +
                "if [ `$rc != 0 ]; then echo; echo 'init.sh FAILED (rc='`$rc') -- see the FAIL line above; press Enter to close'; read x; fi; exit `$rc"
         Step "INIT: init.sh --apply as root in a NEW Ubuntu window ($($script:D)) -- type the password for WSL user '$User' there, then watch apt / git clone / sign-in"
@@ -907,7 +894,6 @@ if (-not $Apply) {
     Emit 'LANEON' 'WOULD run bin/bench-ctxcore.sh --lane-on (officeagent-on, kept when healthy)'
     Emit 'CLI' 'WOULD open GHCP CLI in officeagent-on (tmux main), then FIELDLINK bin/field-link.sh (Teams listener -> tmux main)'
     Emit 'BENCH' $(if ($env:WS_BENCH -ne '1') { 'skip (bench inside the GHCP CLI; WS_BENCH=1 runs install.sh 10 + SMOKE here)' } else { 'WOULD run install.sh 10 AFTER the CLI (bench-ctxcore.sh --fix --make-lane-on with WS_KEEP_ON=1, --check)' })
-    Write-Output $(if ($env:WS_REPORT -eq '0') { 'REPORT=skip (WS_REPORT=0)' } else { 'REPORT=WOULD run bin/install-report.sh (collect, redact, commit, push the install evidence)' })
     Emit 'SMOKE' $(if ($env:WS_SMOKE -eq '0' -or $env:WS_BENCH -ne '1') { 'skip (bench/smoke inside the GHCP CLI)' } else { 'WOULD run bin/smoke-addup.sh after the CLI opens (Excel add-up, window kept open)' })
     return (Done)
 }
@@ -987,8 +973,6 @@ if ($r -eq 'OK') {
         $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', 'cd /workspace && bin/smoke-addup.sh') -Timeout 600 -Tag 'smoke'
         $line = (@(@($out) | Where-Object { $_ -match '^SMOKE ' } | Select-Object -Last 1) -join '') -replace '^SMOKE ', ''
         if (-not $line) { $line = "FAIL no SMOKE line rc=$($script:rc)" }
-        $script:smokeLine = "SMOKE $line"
-        Status "SMOKE $line"
         if ($line -like 'ok*') { Emit 'SMOKE' $line } else { Emit 'SMOKE' "$line (re-run: wsl -u root, cd /workspace, bin/smoke-addup.sh)" }
     }
 }
@@ -996,23 +980,6 @@ else {
     $why = @($script:initOut | Where-Object { $_ -match '=FAIL' }) -join '; '
     if (-not $why) { $why = "RESULT=$r rc=$($script:rc)" }
     Emit 'INIT' "FAIL $why -- fix that, then re-run this bootstrap (init.sh is idempotent: it does the git clone itself and skips what is done; log: wsl -d $($script:D) -u root cat /tmp/ws-init.out)"
-}
-# REPORT: bin/install-report.sh collects this install (result, errors, stage times, LFS/pull bandwidth, GCM/tserver/
-# kiss-auth, SMOKE), redacts it, commits it to fix.archive/install-reports/<host>-<UTC>/ and pushes -- success
-# AND failure, so every install reaches us.  Needs /workspace cloned (INIT got that far).  WS_REPORT=0 skips.
-if ($env:WS_REPORT -ne '0') {
-    $has = @(InDistro 'test -x /workspace/bin/install-report.sh && echo yes') -contains 'yes'
-    if ($has) {
-        Step "REPORT: bin/install-report.sh (collect + redact + commit + push the install evidence)"
-        $q = { param($x) "'" + ("$x" -replace "'", "'\''") + "'" }
-        $rcmd = "cd /workspace && bin/install-report.sh --bootstrap $(& $q "INIT=$r BENCH=$($script:benchOk) fail=$($script:fail)")"
-        if ($script:smokeLine) { $rcmd += " --smoke $(& $q $script:smokeLine)" }
-        $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', $rcmd) -Timeout 900 -Tag 'report'
-        $line = (@(@($out) | Where-Object { $_ -match '^REPORT ' } | Select-Object -Last 1) -join '') -replace '^REPORT ', ''
-        if (-not $line) { $line = "FAIL no REPORT line rc=$($script:rc)" }
-        if ($line -like 'ok*') { Write-Output "REPORT=$line" } else { Write-Output "REPORT=WARN $line" }
-    } elseif ($script:rc -eq 1460) { Write-Output 'REPORT=skip (wsl.exe probe timed out; run later: wsl -u root, cd /workspace, bin/install-report.sh)' }
-    else { Write-Output 'REPORT=skip (/workspace/bin/install-report.sh absent: INIT did not clone)' }
 }
 return (Done)
 }
