@@ -171,7 +171,9 @@ function Distros {   # @{name=..; ver=..; default=$bool} from `wsl -l -v`
     }
     return $r
 }
-function InDistro([string]$cmd) { return Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', $cmd) -Timeout 30 }
+# 120 s: field 11-02 wsl.exe clients took >30 s under load (WSAETIMEDOUT); a 30 s cut made `docker inspect officeagent-on`
+# read as "down" (CLI opened in the wrong container) and install-report.sh as "absent"
+function InDistro([string]$cmd) { return Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', $cmd) -Timeout 120 }
 # plan 10 C.1: live uplink -- one status line to origin install/<host> (best effort; master untouched, no window)
 function Status([string]$line) {
     if (-not $Apply -or -not $script:D) { return }
@@ -999,7 +1001,8 @@ if ($env:WS_REPORT -ne '0') {
         $line = (@(@($out) | Where-Object { $_ -match '^REPORT ' } | Select-Object -Last 1) -join '') -replace '^REPORT ', ''
         if (-not $line) { $line = "FAIL no REPORT line rc=$($script:rc)" }
         if ($line -like 'ok*') { Write-Output "REPORT=$line" } else { Write-Output "REPORT=WARN $line" }
-    } else { Write-Output 'REPORT=skip (/workspace/bin/install-report.sh absent: INIT did not clone)' }
+    } elseif ($script:rc -eq 1460) { Write-Output 'REPORT=skip (wsl.exe probe timed out; run later: wsl -u root, cd /workspace, bin/install-report.sh)' }
+    else { Write-Output 'REPORT=skip (/workspace/bin/install-report.sh absent: INIT did not clone)' }
 }
 return (Done)
 }
