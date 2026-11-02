@@ -915,26 +915,37 @@ Emit 'NODEPATH' "win=$(if ($NodeWin) { $NodeWin } else { 'NOT FOUND' })"
 if ($r -eq 'OK') {
     Emit 'INIT' "ok init.sh --apply in $($script:D)"
     WinTier
-    # CLI FIRST (field 2026-11-01: BENCH waited 200 s per stage on a hung status push, the user saw no window and gave up).
-    # init.sh RESULT=OK means stage 9 left officeagent-dev running; open the CLI now, bench + smoke run after it.
-    $script:ctrUp = ((@(InDistro 'docker inspect -f {{.State.Running}} officeagent-dev 2>/dev/null') -join '') -match 'true')
-    # Land the user in GHCP CLI inside the bench container, in its OWN window (init.sh runs install.sh with WS_CLI=0:
-    # a TUI inside the init window filled /tmp/ws-init.out with binary and replaced the window).  $env:WS_CLI=0 skips.
-    # container down -> a plain WSL root shell in /workspace instead (fix, then ./install.sh 10 opens the CLI itself).
-    if ($env:WS_CLI -ne '0') {
+    # CLI lands in officeagent-on (lane on: root dev-loop aserver, ctxcore flight; plan 14) -- user 11-02:
+    #   "the CLI not in officeagent-on ... still in officeagent-dev".  The old code opened it in officeagent-dev BEFORE
+    #   BENCH built lane on.  Now: lane on already up (rerun) -> CLI first, then BENCH; else BENCH first (it makes lane on),
+    #   then the CLI.  Falls back to officeagent-dev only when lane on is still down after BENCH.  $env:WS_CLI_CTR overrides.
+    $script:cliOpened = $false
+    function CtrUp($n) { ((@(InDistro "docker inspect -f {{.State.Running}} $n 2>/dev/null") -join '') -match 'true') }
+    function OpenCli([switch]$Final) {
+        if ($script:cliOpened -or $env:WS_CLI -eq '0') { return }
+        $want = $(if ($env:WS_CLI_CTR) { $env:WS_CLI_CTR } else { 'officeagent-on' })
+        $ctr = $(if (CtrUp $want) { $want } elseif ($Final -and (CtrUp 'officeagent-dev')) { 'officeagent-dev' } else { '' })
+        if (-not $ctr -and -not $Final) { return }
+        $script:cliOpened = $true
+        # Land the user in GHCP CLI inside the bench container, in its OWN window (init.sh runs install.sh with WS_CLI=0:
+        # a TUI inside the init window filled /tmp/ws-init.out with binary and replaced the window).  $env:WS_CLI=0 skips.
         $path = (Get-Command wsl.exe).Source
-        if ($script:ctrUp) { $title = 'GHCP CLI (officeagent-dev)'
-            $cli = @('-d', $script:D, '-u', 'root', '-e', 'docker', 'exec', '-it', '-w', '/workspace', 'officeagent-dev', 'bash', '-ic', 't main || echo "GHCP CLI exited rc=$? -- staying in the container shell (t = copilot in tmux, h = pick model, ec = emacs)" && exec bash -i') }
+        if ($ctr) { $title = "GHCP CLI ($ctr)"
+            $cli = @('-d', $script:D, '-u', 'root', '-e', 'docker', 'exec', '-it', '-w', '/workspace', $ctr, 'bash', '-ic', 't main || echo "GHCP CLI exited rc=$? -- staying in the container shell (t = copilot in tmux, h = pick model, ec = emacs)" && exec bash -i') }
         else { $title = 'WSL /workspace (container down)'
-            $cli = @('-d', $script:D, '-u', 'root', '--cd', '/workspace', '-e', 'bash', '-c', 'echo "officeagent-dev is not running -- ./install.sh 2 9 10 (opens GHCP CLI)" && bin/bench-ctxcore.sh --check && exec bash -i || exec bash -i') }
+            $cli = @('-d', $script:D, '-u', 'root', '--cd', '/workspace', '-e', 'bash', '-c', 'echo "officeagent-on is not running -- ./install.sh 10 (makes lane on, opens GHCP CLI)" && bin/bench-ctxcore.sh --check && exec bash -i || exec bash -i') }
         # NO ';' in $cli: wt.exe splits its command line on ';' (a 2nd tab ran 'exec' -> 'cannot find the file specified')
         $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
         if ($wt -and $env:WS_WT -ne '0') { Start-Process -FilePath $wt.Source -ArgumentList ((@('-w', 'new', 'new-tab', '--title', $title, $path) + $cli | ForEach-Object { Q $_ }) -join ' ') }
         else { Start-Process -FilePath $path -ArgumentList (($cli | ForEach-Object { Q $_ }) -join ' ') }
-        if (-not $script:ctrUp) { Emit 'CLI' "NOT opened (officeagent-dev down) -- opened a WSL shell in /workspace; fix, then ./install.sh 10" }
-        else { Emit 'CLI' "opened GHCP CLI in officeagent-dev:/workspace (new window; tmux 'main', detach C-b d). Later: wsl, then docker exec -it officeagent-dev bash -> t / h / ec" }
+        if (-not $ctr) { Emit 'CLI' "NOT opened ($want down) -- opened a WSL shell in /workspace; fix, then ./install.sh 10" }
+        elseif ($ctr -ne $want) { Emit 'CLI' "WARN opened in $ctr ($want down after BENCH -- plan 14 wants $want; fix: ./install.sh 10)" }
+        else { Emit 'CLI' "opened GHCP CLI in ${ctr}:/workspace (new window; tmux 'main', detach C-b d). Later: wsl, then docker exec -it $ctr bash -> t / h / ec" }
     }
+    $script:ctrUp = (CtrUp 'officeagent-dev')
+    OpenCli
     BenchReady
+    OpenCli -Final
     # SMOKE: one real turn through wserver (Excel + our pane -> aserver): new sheet Numbers 1..10, A11 = sum (55).
     # The Excel window is LEFT OPEN for the user; the next smoke closes only windows it kept itself.
     # $env:WS_SMOKE=0 skips.  bin/smoke-addup.sh settles the pane first (the NAA relay reloads it once ~10 s in).
