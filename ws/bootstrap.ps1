@@ -259,7 +259,14 @@ $DistroImg = 'https://releases.ubuntu.com/26.04.1/ubuntu-26.04.1-wsl-amd64.wsl' 
 $DistroSha = '48D56724B5C8E60F24893E83E73BBB58C60B3CA22FBA3DA977075420ACD54104'
 function HaveDistro { [bool](Distros | Where-Object { $_.name -eq $script:D }) }
 function DistroVer { Step "WSL: start $($script:D) (first start can take a minute)"
-    (Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', '. /etc/os-release; echo $ID $VERSION_ID') -Timeout 90 | Select-Object -Last 1) }
+    # field 11-02 rerun: the WSL service answered Wsl/Service/WSAETIMEDOUT once (busy VM right after the last run) and the
+    # bootstrap failed 'needs ubuntu 26.04'.  Same as the init probe: that error is transient -> try again (4 tries).
+    for ($i = 1; $i -le 4; $i++) {
+        $o = @(Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', '. /etc/os-release; echo $ID $VERSION_ID') -Timeout 90)
+        if (-not (($o -join ' ') -match 'WSAETIMEDOUT|Wsl/Service/')) { return ($o | Select-Object -Last 1) }
+        Write-Host "  wsl: WSL service busy (WSAETIMEDOUT), try $i/4 -- retrying"
+    }
+    return 'WSL service timeout (Wsl/Service/WSAETIMEDOUT x4): close other WSL windows or run: wsl --terminate ' + $script:D }
 $haveWsl = [bool](Get-Command wsl.exe -ErrorAction SilentlyContinue)
 Step "WSL: is $($script:D) installed? (wsl -l -v)"
 $have = $haveWsl -and (HaveDistro)
