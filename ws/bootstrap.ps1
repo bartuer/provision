@@ -666,13 +666,16 @@ if ($GcmWin) { Write-Host "  gcm     : $GcmWin" -ForegroundColor Green } else { 
 $InitProbe = 'if [ -s /tmp/ws-init.rc ]; then echo done:$(tr -dc 0-9 < /tmp/ws-init.rc); elif [ -s /tmp/ws-init.pid ] && kill -0 $(cat /tmp/ws-init.pid) 2>/dev/null; then echo running:$(cat /tmp/ws-init.pid); else echo gone; fi'   # no double quotes: PS 5.1 does not escape them on a native argv
 function WatchInit($probe, $tail, $p, [int]$Budget = 7200, [double]$Sleep = 5, [int]$Stall = 900, [int]$GoneMax = 24) {
     # -> @{state=DONE|FAILED|LOST|TIMEOUT; rc}.  TIMEOUT = budget spent AND output stalled $Stall s.  Only DONE/FAILED come from init.sh; a closed console is only logged.
-    $sw = [Diagnostics.Stopwatch]::StartNew(); $gone = 0; $last = ''; $lastT = 0; $warned = $false; $cexit = $false; $stage = ''; $over = $false
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $gone = 0; $last = ''; $lastT = 0; $warned = $false; $cexit = $false; $stage = ''; $over = $false; $perr = 0
     while ($true) {
         $s = "$(& $probe)".Trim()
         if ($s -match '^done:(\d+)$') { $rc = [int]$Matches[1]; Write-Host "  init: probe $s"; return @{ state = $(if ($rc) { 'FAILED' } else { 'DONE' }); rc = $rc } }
         if ($s -match '^running:\d+$') { $gone = 0 }
         elseif ($s -eq 'gone') { $gone++; if ($gone -ge $GoneMax) { Write-Host "  init: probe gone x$gone (no rc file, no live job)"; return @{ state = 'LOST'; rc = $null } } }
-        else { Write-Host ("  init: probe error at {0}s (not done, retrying): {1}" -f [int]$sw.Elapsed.TotalSeconds, ($s -replace "`0", '')) }
+        # a busy WSL service answers the 5s status poll with Wsl/Service/WSAETIMEDOUT -- harmless, init.sh keeps running;
+        #   stay quiet, report only a long unbroken run of failed polls (user 11-02: "what is this for? clean it").
+        else { $perr++; if ($perr -eq 24) { Write-Host ("  init: WARN status probe failing for 2+ min (still watching): {0}" -f (($s -replace "`0", '') -split "`n")[0]) } }
+        if ($s -match '^(running|done|gone)') { $perr = 0 }
         if ($p -and -not $cexit -and $p.HasExited) { $cexit = $true; Write-Host "  init: client-exit (console window closed rc=$($p.ExitCode)) -- still watching the WSL job" }
         $t = [int]$sw.Elapsed.TotalSeconds
         $tl = @(& $tail | ForEach-Object { ("$_" -replace "`0", '').Trim() } | Where-Object { $_ })
