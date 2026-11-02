@@ -21,8 +21,11 @@
               re-run is this same bootstrap (everything is idempotent).
       WIN     after INIT ok: the Windows half, install.ps1 from the distro (WebView2 149 + pin, Excel shim,
               WEF, ASR, ssh, docker shims, VM boot task).  WS_SKIP_WIN=1 skips.
-      BENCH   after WIN: install.sh 10 = bin/bench-ctxcore.sh --fix --make-lane-on, then its --check clean.
-              WS_SKIP_BENCH=1 skips.  CLI (in /workspace) opens only if BENCH ok; else a WSL shell there.
+      LANEON  after WIN: bin/bench-ctxcore.sh --lane-on = officeagent-on only (kept when healthy; no bench, no Excel).
+      CLI     GHCP CLI window in officeagent-on (tmux main); officeagent-dev only if lane on is down.  WS_CLI=0 skips.
+      FIELDLINK bin/field-link.sh: Teams listener unit installed/refreshed + restarted (wakes the CLI's tmux main).
+      BENCH   only with WS_BENCH=1 (default: bench inside the GHCP CLI) -- after the CLI: install.sh 10 = bin/bench-ctxcore.sh --fix --make-lane-on (WS_KEEP_ON=1: never
+              recreates the CLI's container), then its --check clean.  WS_SKIP_BENCH=1 skips.
       SMOKE   after CLI (BENCH ok): bin/smoke-addup.sh = one ssg turn via wserver -- new sheet Numbers 1..10,
               A11 = SUM = 55; the Excel window stays open.  WS_SMOKE=0 skips.
       REPORT  last, success or failure: bin/install-report.sh = install result, errors, stage times, network
@@ -225,7 +228,8 @@ function WinTier {
 function BenchReady {
     if ($env:WS_SKIP_BENCH -eq '1') { $script:benchOk = $true; Emit 'BENCH' 'skip (WS_SKIP_BENCH=1)'; return }
     Step "BENCH: install.sh 10 (bench-ctxcore.sh --fix --make-lane-on, then --check)"
-    $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', 'cd /workspace && WS_CLI=0 WS_STATUS=1 ./install.sh 10') -Timeout 900 -Tag 'bench'
+    $keep = $(if ($script:cliCtr -eq 'officeagent-on') { 'WS_KEEP_ON=1 ' } else { '' })   # never rm the CLI's container
+    $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', "cd /workspace && ${keep}WS_CLI=0 WS_STATUS=1 ./install.sh 10") -Timeout 900 -Tag 'bench'
     $line = @(@($out) | Where-Object { $_ -match '^STAGE=10 ' } | Select-Object -Last 1) -join ''
     $script:benchOk = ($script:rc -eq 0)
     Status "BENCH $(if ($script:benchOk) { 'ok' } elseif ($script:rc -eq 1460) { 'PENDING timeout 900s' } else { 'FAIL' }) $line"
@@ -888,9 +892,11 @@ if (-not $Apply) {
     if ($distroUp) { FixWslNet; RunInit '--dry-run' }
     Emit 'INIT' "WOULD run init.sh --apply ($src) as root in $($script:D): WS_URL=$WsUrl -> /workspace + ./install.sh"
     Emit 'WIN' $(if ($env:WS_SKIP_WIN -eq '1') { 'skip (WS_SKIP_WIN=1)' } else { 'WOULD run install.ps1 from the distro (WV2 PIN SHIM WEF ASR SSH DOCKER VMBOOT)' })
-    Emit 'BENCH' $(if ($env:WS_SKIP_BENCH -eq '1') { 'skip (WS_SKIP_BENCH=1)' } else { 'WOULD run install.sh 10 (bench-ctxcore.sh --fix --make-lane-on, --check)' })
+    Emit 'LANEON' 'WOULD run bin/bench-ctxcore.sh --lane-on (officeagent-on, kept when healthy)'
+    Emit 'CLI' 'WOULD open GHCP CLI in officeagent-on (tmux main), then FIELDLINK bin/field-link.sh (Teams listener -> tmux main)'
+    Emit 'BENCH' $(if ($env:WS_BENCH -ne '1') { 'skip (bench inside the GHCP CLI; WS_BENCH=1 runs install.sh 10 + SMOKE here)' } else { 'WOULD run install.sh 10 AFTER the CLI (bench-ctxcore.sh --fix --make-lane-on with WS_KEEP_ON=1, --check)' })
     Write-Output $(if ($env:WS_REPORT -eq '0') { 'REPORT=skip (WS_REPORT=0)' } else { 'REPORT=WOULD run bin/install-report.sh (collect, redact, commit, push the install evidence)' })
-    Emit 'SMOKE' $(if ($env:WS_SMOKE -eq '0' -or $env:WS_SKIP_BENCH -eq '1') { 'skip (WS_SMOKE=0)' } else { 'WOULD run bin/smoke-addup.sh after the CLI opens (Excel add-up, window kept open)' })
+    Emit 'SMOKE' $(if ($env:WS_SMOKE -eq '0' -or $env:WS_BENCH -ne '1') { 'skip (bench/smoke inside the GHCP CLI)' } else { 'WOULD run bin/smoke-addup.sh after the CLI opens (Excel add-up, window kept open)' })
     return (Done)
 }
 if (-not $distroUp) { Emit 'INIT' "FAIL distro $($script:D) not registered"; return (Done) }
@@ -926,7 +932,7 @@ if ($r -eq 'OK') {
         $want = $(if ($env:WS_CLI_CTR) { $env:WS_CLI_CTR } else { 'officeagent-on' })
         $ctr = $(if (CtrUp $want) { $want } elseif ($Final -and (CtrUp 'officeagent-dev')) { 'officeagent-dev' } else { '' })
         if (-not $ctr -and -not $Final) { return }
-        $script:cliOpened = $true
+        $script:cliOpened = $true; $script:cliCtr = $ctr
         # Land the user in GHCP CLI inside the bench container, in its OWN window (init.sh runs install.sh with WS_CLI=0:
         # a TUI inside the init window filled /tmp/ws-init.out with binary and replaced the window).  $env:WS_CLI=0 skips.
         $path = (Get-Command wsl.exe).Source
@@ -942,10 +948,24 @@ if ($r -eq 'OK') {
         elseif ($ctr -ne $want) { Emit 'CLI' "WARN opened in $ctr ($want down after BENCH -- plan 14 wants $want; fix: ./install.sh 10)" }
         else { Emit 'CLI' "opened GHCP CLI in ${ctr}:/workspace (new window; tmux 'main', detach C-b d). Later: wsl, then docker exec -it $ctr bash -> t / h / ec" }
     }
+    # User 11-02 "stop bench before CLI setup" + "fix the correct CLI in correct container with field connection":
+    # LANE-ON (only officeagent-on, no bench) -> CLI in it -> FIELD-LINK (Teams listener wakes tmux main) -> BENCH -> SMOKE.
     $script:ctrUp = (CtrUp 'officeagent-dev')
-    OpenCli
-    BenchReady
+    if ($env:WS_CLI -ne '0' -and -not $env:WS_CLI_CTR) {
+        Step "LANE-ON: bench-ctxcore.sh --lane-on (officeagent-on for the GHCP CLI; kept when healthy)"
+        $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', 'cd /workspace && bin/bench-ctxcore.sh --lane-on') -Timeout 900 -Tag 'laneon'
+        $line = (@(@($out) | Where-Object { $_ -match '^LANE-ON ' } | Select-Object -Last 1) -join '') -replace '^LANE-ON ', ''
+        Emit 'LANEON' $(if ($line) { $line } else { "FAIL no LANE-ON line rc=$($script:rc)" })
+    }
     OpenCli -Final
+    if ($script:cliOpened) {
+        $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', 'cd /workspace && bin/field-link.sh') -Timeout 120 -Tag 'fieldlink'
+        $line = (@(@($out) | Where-Object { $_ -match '^FIELD-LINK ' } | Select-Object -Last 1) -join '') -replace '^FIELD-LINK ', ''
+        Emit 'FIELDLINK' $(if ($line) { $line } else { "FAIL no FIELD-LINK line rc=$($script:rc)" })
+    }
+    # User 11-02 "stop the bench failed again and again, we will bench inside CLI": BENCH + SMOKE only with WS_BENCH=1
+    # (the CLI runs ./install.sh 10 / bin/smoke-addup.sh itself).
+    if ($env:WS_BENCH -eq '1') { BenchReady } else { $script:benchOk = $false; Emit 'BENCH' 'skip -- run inside the GHCP CLI: ./install.sh 10, bin/smoke-addup.sh (WS_BENCH=1 runs it here)' }
     # SMOKE: one real turn through wserver (Excel + our pane -> aserver): new sheet Numbers 1..10, A11 = sum (55).
     # The Excel window is LEFT OPEN for the user; the next smoke closes only windows it kept itself.
     # $env:WS_SMOKE=0 skips.  bin/smoke-addup.sh settles the pane first (the NAA relay reloads it once ~10 s in).
