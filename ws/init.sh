@@ -508,9 +508,18 @@ update_do() {
   local g="git -C $WS_DIR" dirty st=0
   dirty="$($g status --porcelain --untracked-files=no --ignore-submodules=dirty | head -5 | tr '\n' ' ')"
   if [ -n "$dirty" ]; then $g stash push -q -m "ws-init UPDATE $(date -u +%FT%TZ)" || { echo "UPDATE: WARN stash failed -- left alone"; return 0; }; st=1; fi
-  if ! GIT_LFS_SKIP_SMUDGE=1 $g merge --ff-only --quiet "$up"; then
-    [ $st = 1 ] && $g stash pop -q
-    echo "UPDATE: WARN ${h:0:7} cannot fast-forward to $up ${u:0:7} (local commits?) -- left alone: git -C $WS_DIR status"; return 0
+  if ! GIT_LFS_SKIP_SMUDGE=1 $g merge --ff-only --quiet "$up" 2>/dev/null; then
+    # diverged (local commits, e.g. a field CLI's integration merge, DESKTOP-7BM977C 11-02): ORIGIN WINS, as for
+    # edits, but the local commits are SAVED FIRST -- branch ws-local/<host>-<ts> at HEAD, pushed to origin (user:
+    # "field first commit, push not lost work").  No push -> no reset: left alone, as before.
+    local b; b="ws-local/$(hostname -s)-$(date -u +%m%d%H%M)"
+    if $g branch -q "$b" HEAD && GIT_TERMINAL_PROMPT=0 $g push -q origin "$b" 2>/dev/null \
+       && GIT_LFS_SKIP_SMUDGE=1 $g reset -q --hard "$up"; then
+      echo "UPDATE: ${h:0:7} had local commits -> saved as origin/$b; now at $up ${u:0:7}"
+    else
+      [ $st = 1 ] && $g stash pop -q
+      echo "UPDATE: WARN ${h:0:7} cannot fast-forward to $up ${u:0:7} and saving local commits as $b failed -- left alone: git -C $WS_DIR status"; return 0
+    fi
   fi
   if [ $st = 1 ]; then
     if $g stash apply -q >/dev/null 2>&1; then $g stash drop -q; echo "UPDATE: local edits re-applied: $dirty"
