@@ -796,12 +796,17 @@ function WsProxyUp {   # node relay on Windows loopback (mirrored WSL shares it)
 const http = require('http'), net = require('net');
 const s = http.createServer((q, r) => {
   let u; try { u = new URL(q.url); } catch { r.writeHead(400); return r.end(); }
+  if (deny(u.hostname)) { r.writeHead(403); return r.end(); }
   const p = http.request({ host: u.hostname, port: u.port || 80, path: u.pathname + u.search, method: q.method, headers: q.headers },
     x => { r.writeHead(x.statusCode, x.headers); x.pipe(r); });
   p.on('error', () => { if (!r.headersSent) r.writeHead(502); r.end(); }); q.pipe(p);
 });
+// registry.npmjs.org is IT-blocked on GSA laptops and every attempt pops a GSA "blocked" toast: refuse it here
+//   (npm then falls back / fails fast; install.sh uses archive bundles + the ADO feed instead)
+const deny = h => /(^|\.)npmjs\.(org|com)$/i.test(h);
 s.on('connect', (q, c, hd) => {
   const i = q.url.lastIndexOf(':'), h = q.url.slice(0, i), pt = +q.url.slice(i + 1) || 443;
+  if (deny(h)) { c.end('HTTP/1.1 403 Forbidden\r\n\r\n'); return; }
   const t = net.connect(pt, h, () => { c.write('HTTP/1.1 200 OK\r\n\r\n'); t.write(hd); t.pipe(c); c.pipe(t); });
   t.setTimeout(30000, () => { if (t.connecting) t.destroy(); });  // connect timeout only; tunnels may idle
   t.on('error', () => c.destroy()); c.on('error', () => t.destroy()); t.on('close', () => c.destroy()); c.on('close', () => t.destroy());
