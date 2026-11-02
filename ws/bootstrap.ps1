@@ -930,7 +930,9 @@ if ($r -eq 'OK') {
     function OpenCli([switch]$Final) {
         if ($script:cliOpened -or $env:WS_CLI -eq '0') { return }
         $want = $(if ($env:WS_CLI_CTR) { $env:WS_CLI_CTR } else { 'officeagent-on' })
-        $ctr = $(if (CtrUp $want) { $want } elseif ($Final -and (CtrUp 'officeagent-dev')) { 'officeagent-dev' } else { '' })
+        # never fall back to officeagent-dev (user 11-02: "open wrong container again?"): lane on down -> the window
+        # itself runs --lane-on, then opens the CLI in it
+        $ctr = $(if (CtrUp $want) { $want } else { '' })
         if (-not $ctr -and -not $Final) { return }
         $script:cliOpened = $true; $script:cliCtr = $ctr
         # Land the user in GHCP CLI inside the bench container, in its OWN window (init.sh runs install.sh with WS_CLI=0:
@@ -938,14 +940,13 @@ if ($r -eq 'OK') {
         $path = (Get-Command wsl.exe).Source
         if ($ctr) { $title = "GHCP CLI ($ctr)"
             $cli = @('-d', $script:D, '-u', 'root', '-e', 'docker', 'exec', '-it', '-w', '/workspace', $ctr, 'bash', '-ic', 't main || echo "GHCP CLI exited rc=$? -- staying in the container shell (t = copilot in tmux, h = pick model, ec = emacs)" && exec bash -i') }
-        else { $title = 'WSL /workspace (container down)'
-            $cli = @('-d', $script:D, '-u', 'root', '--cd', '/workspace', '-e', 'bash', '-c', 'echo "officeagent-on is not running -- ./install.sh 10 (makes lane on, opens GHCP CLI)" && bin/bench-ctxcore.sh --check && exec bash -i || exec bash -i') }
+        else { $title = "GHCP CLI ($want, starting)"
+            $cli = @('-d', $script:D, '-u', 'root', '--cd', '/workspace', '-e', 'bash', '-c', "echo `"$want is down -- bin/bench-ctxcore.sh --lane-on, then GHCP CLI in it`" && bin/bench-ctxcore.sh --lane-on && exec docker exec -it -w /workspace $want bash -ic 't main' || exec bash -i") }
         # NO ';' in $cli: wt.exe splits its command line on ';' (a 2nd tab ran 'exec' -> 'cannot find the file specified')
         $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
         if ($wt -and $env:WS_WT -ne '0') { Start-Process -FilePath $wt.Source -ArgumentList ((@('-w', 'new', 'new-tab', '--title', $title, $path) + $cli | ForEach-Object { Q $_ }) -join ' ') }
         else { Start-Process -FilePath $path -ArgumentList (($cli | ForEach-Object { Q $_ }) -join ' ') }
-        if (-not $ctr) { Emit 'CLI' "NOT opened ($want down) -- opened a WSL shell in /workspace; fix, then ./install.sh 10" }
-        elseif ($ctr -ne $want) { Emit 'CLI' "WARN opened in $ctr ($want down after BENCH -- plan 14 wants $want; fix: ./install.sh 10)" }
+        if (-not $ctr) { Emit 'CLI' "WARN $want down after LANE-ON -- the CLI window runs bin/bench-ctxcore.sh --lane-on, then opens GHCP CLI in $want" }
         else { Emit 'CLI' "opened GHCP CLI in ${ctr}:/workspace (new window; tmux 'main', detach C-b d). Later: wsl, then docker exec -it $ctr bash -> t / h / ec" }
     }
     # User 11-02 "stop bench before CLI setup" + "fix the correct CLI in correct container with field connection":
