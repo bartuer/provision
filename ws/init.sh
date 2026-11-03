@@ -230,19 +230,27 @@ write_wslconf() {   # systemd=true under [boot]; every other line kept
   fi
   cat "$t" > "$f"; rm -f "$t"
 }
-# DOCKERCFG: dockerd pulls 3 layers at a time by default; the OA base is 36 layers (one 1.1 GB) -> 16 like LFS
+# DOCKERCFG: dockerd pulls 3 layers at a time by default; the OA base is 36 layers (one 1.1 GB) -> 16 like LFS.
+# bip/default-address-pools: WSL NAT picks a random /20 in 172.16/12 at every network recreate, docker0 takes
+# 172.17|18/16 -- when they overlap the distro nameserver sits inside docker0 and container DNS dies (11-03 field).
 DOCKER_JOBS="${INIT_DOCKER_JOBS:-16}"
-dockercfg_ok() { grep -q '"max-concurrent-downloads"' /etc/docker/daemon.json 2>/dev/null; }
-dockercfg_do() {   # only creates a MISSING daemon.json; restarts dockerd only when it runs no container
-  mkdir -p /etc/docker && printf '{\n  "max-concurrent-downloads": %s\n}\n' "$DOCKER_JOBS" > /etc/docker/daemon.json || return 1
+DOCKER_BIP="${INIT_DOCKER_BIP:-10.231.0.1/24}" DOCKER_POOL="${INIT_DOCKER_POOL:-10.232.0.0/16}"
+DOCKERCFG_JQ='.["max-concurrent-downloads"] //= ($j|tonumber) | .bip //= $b | .["default-address-pools"] //= [{base:$p,size:24}]'
+dockercfg_ok() { local f=/etc/docker/daemon.json; [ -s "$f" ] && jq -e --arg j "$DOCKER_JOBS" --arg b "$DOCKER_BIP" --arg p "$DOCKER_POOL" \
+                   "($DOCKERCFG_JQ) == ." "$f" >/dev/null 2>&1; }
+dockercfg_do() {   # merges missing keys (keeps the rest, backup .bak-init); restarts dockerd only when it runs no container
+  local f=/etc/docker/daemon.json t; mkdir -p /etc/docker; [ -s "$f" ] || echo '{}' > "$f"
+  t="$(mktemp)"; cp -a "$f" "$f.bak-init"
+  jq --arg j "$DOCKER_JOBS" --arg b "$DOCKER_BIP" --arg p "$DOCKER_POOL" "$DOCKERCFG_JQ" "$f.bak-init" > "$t" || { rm -f "$t"; return 1; }
+  cat "$t" > "$f"; rm -f "$t"
   if docker_up && has_systemd; then
     if [ -z "$(docker ps -q 2>/dev/null)" ]; then systemctl restart docker.service >/dev/null 2>&1; docker_wait
-    else echo "DOCKERCFG: containers running -- dockerd keeps 3 until its next restart"; fi
+    else echo "DOCKERCFG: containers running -- applies at the next dockerd restart (systemctl restart docker; containers come back)"; fi
   fi
 }
 if dockercfg_ok; then say DOCKERCFG ok
-elif [ -e /etc/docker/daemon.json ]; then say DOCKERCFG "WARN /etc/docker/daemon.json exists without max-concurrent-downloads -- left alone (pulls 3 layers at a time)"
-else act DOCKERCFG "/etc/docker/daemon.json max-concurrent-downloads=$DOCKER_JOBS (default 3)" dockercfg_do; fi
+elif ! command -v jq >/dev/null 2>&1; then say DOCKERCFG "WARN jq missing -- /etc/docker/daemon.json left alone"
+else act DOCKERCFG "/etc/docker/daemon.json max-concurrent-downloads=$DOCKER_JOBS bip=$DOCKER_BIP pools=$DOCKER_POOL (merge missing keys)" dockercfg_do; fi
 if docker_up; then say DOCKERD ok
 elif has_systemd; then
   act DOCKERD "systemctl enable --now docker" sh -c 'systemctl enable --now docker.service >/dev/null 2>&1'
