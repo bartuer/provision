@@ -251,6 +251,10 @@ function DistroVer { Step "WSL: start $($script:D) (first start can take a minut
     # bootstrap failed 'needs ubuntu 26.04'.  Same as the init probe: that error is transient -> try again (4 tries).
     for ($i = 1; $i -le 4; $i++) {
         $o = @(Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'sh', '-c', '. /etc/os-release; echo $ID $VERSION_ID') -Timeout 90)
+        # field 11-03 MTU7IN0: wsl appends 'Failed to start the systemd user session for 'root'' AFTER the
+        # 'ubuntu 26.04' line (non-fatal) -> take the '<id> <version>' line, not the last line.
+        $idv = $o | Where-Object { "$_" -match '^[a-z]+ [0-9][0-9.]*$' } | Select-Object -Last 1
+        if ($idv) { return $idv }
         if (-not (($o -join ' ') -match 'WSAETIMEDOUT|Wsl/Service/')) { return ($o | Select-Object -Last 1) }
         Write-Host "  wsl: WSL service busy (WSAETIMEDOUT), try $i/4 -- retrying"
     }
