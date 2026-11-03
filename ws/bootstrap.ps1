@@ -19,9 +19,10 @@
       INIT    init.sh (next to this file, else -InitUrl) run as root in the distro: dry-run -> its own dry
               run is shown as `  init: ...` lines; real run -> `init.sh --apply`.  On failure the one-liner to
               re-run is this same bootstrap (everything is idempotent).
-      WIN     after INIT ok: the Windows half, install.ps1 from the distro (WebView2 149 + pin, Excel shim,
-              WEF, ASR, ssh, docker shims, VM boot task).  WS_SKIP_WIN=1 skips.
-      LANEON  after WIN: bin/bench-ctxcore.sh --lane-on = officeagent-on only (kept when healthy; no bench, no Excel).
+      LANEON  after INIT ok: bin/bench-ctxcore.sh --lane-on = officeagent-on only (kept when healthy; no bench, no Excel);
+              it writes `Host bench` -> officeagent-on :2222 (plan 14 H: dev = `Host devcontainer` :2223).
+      WIN     after LANEON: the Windows half, install.ps1 from the distro (WebView2 149 + pin, Excel shim,
+              WEF, ASR, ssh bench, docker shims, VM boot task).  WS_SKIP_WIN=1 skips.
       CLI     GHCP CLI window in officeagent-on (tmux main); officeagent-dev only if lane on is down.  WS_CLI=0 skips.
       FIELDLINK bin/field-link.sh: Teams listener unit installed/refreshed + restarted (wakes the CLI's tmux main).
       BENCH   only with WS_BENCH=1 (default: bench inside the GHCP CLI) -- after the CLI: install.sh 10 = bin/bench-ctxcore.sh --fix --make-lane-on (WS_KEEP_ON=1: never
@@ -918,7 +919,6 @@ Emit 'GCMPATH' "win=$(if ($GcmWin) { $GcmWin } else { 'NOT FOUND' }) git=$GitWin
 Emit 'NODEPATH' "win=$(if ($NodeWin) { $NodeWin } else { 'NOT FOUND' })"
 if ($r -eq 'OK') {
     Emit 'INIT' "ok init.sh --apply in $($script:D)"
-    WinTier
     # CLI lands in officeagent-on (lane on: root dev-loop aserver, ctxcore flight; plan 14) -- user 11-02:
     #   "the CLI not in officeagent-on ... still in officeagent-dev".  The old code opened it in officeagent-dev BEFORE
     #   BENCH built lane on.  Now: lane on already up (rerun) -> CLI first, then BENCH; else BENCH first (it makes lane on),
@@ -956,6 +956,9 @@ if ($r -eq 'OK') {
         $line = (@(@($out) | Where-Object { $_ -match '^LANE-ON ' } | Select-Object -Last 1) -join '') -replace '^LANE-ON ', ''
         Emit 'LANEON' $(if ($line) { $line } else { "FAIL no LANE-ON line rc=$($script:rc)" })
     }
+    # WIN after LANE-ON (plan 14 H.3): install.ps1 SSH copies known_hosts.bench + probes `ssh bench` = officeagent-on :2222,
+    #   which only LANE-ON creates (install.sh's own stage 3 now writes `Host devcontainer` :2223 for officeagent-dev).
+    WinTier
     OpenCli -Final
     if ($script:cliOpened) {
         $out = Native 'wsl.exe' @('-d', $script:D, '-u', 'root', '-e', 'bash', '-c', 'cd /workspace && bin/field-link.sh') -Timeout 120 -Tag 'fieldlink'
