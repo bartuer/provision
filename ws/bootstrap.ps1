@@ -245,7 +245,11 @@ $script:D = $(if ($Distro) { $Distro } else { $NewDistro })
 $WslMsi = 'https://github.com/microsoft/WSL/releases/download/2.7.14/wsl.2.7.14.0.x64.msi'   # = fleet c17 `wsl --version`; plain release URL, no API
 $DistroImg = 'https://releases.ubuntu.com/26.04.1/ubuntu-26.04.1-wsl-amd64.wsl'   # = microsoft/WSL DistributionInfo.json Ubuntu-26.04
 $DistroSha = '48D56724B5C8E60F24893E83E73BBB58C60B3CA22FBA3DA977075420ACD54104'
-function HaveDistro { [bool](Distros | Where-Object { $_.name -eq $script:D }) }
+# field 11-03 7BM977C (fresh unregister + install): `wsl -l -v` hung 20 s right after DistroVer had run inside the distro
+# -> empty list read as "not registered" -> INIT=FAIL.  The Lxss registry key is what wsl.exe lists, and needs no WSL service.
+function LxssHas { [bool](Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss' -EA SilentlyContinue |
+    Where-Object { (Get-ItemProperty $_.PSPath -EA SilentlyContinue).DistributionName -eq $script:D }) }
+function HaveDistro { [bool](Distros | Where-Object { $_.name -eq $script:D }) -or (LxssHas) }
 function DistroVer { Step "WSL: start $($script:D) (first start can take a minute)"
     # field 11-02 rerun: the WSL service answered Wsl/Service/WSAETIMEDOUT once (busy VM right after the last run) and the
     # bootstrap failed 'needs ubuntu 26.04'.  Same as the init probe: that error is transient -> try again (4 tries).
@@ -891,7 +895,7 @@ function FixWslNet {
     # not fatal: init.sh's NET step reports it again before apt
     Emit 'WSLNET' "WARN archive.ubuntu.com unreachable from WSL with NAT and mirrored -- check Windows itself reaches it (curl.exe -sI http://archive.ubuntu.com); if not, connect the corp VPN, then run the same command again"; $script:netOk = $true
 }
-$distroUp = [bool](Distros | Where-Object { $_.name -eq $script:D })
+$distroUp = HaveDistro
 if (-not $Apply) {
     if ($distroUp) { FixWslNet; RunInit '--dry-run' }
     Emit 'INIT' "WOULD run init.sh --apply ($src) as root in $($script:D): WS_URL=$WsUrl -> /workspace + ./install.sh"
