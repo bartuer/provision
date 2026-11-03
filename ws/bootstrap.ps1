@@ -831,8 +831,11 @@ s.listen(3128, '127.0.0.1');
     $arg = "-NoProfile -WindowStyle Hidden -Command `"while (`$true) { & '$NodeExe' '$js'; Start-Sleep 5 }`""
     try {
         $a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
-        $t = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
-        $st = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+        # never a manual start (user 11-03: "the 3128 proxy server should not start manually"): logon trigger + a
+        #   2-min repeating trigger; IgnoreNew = a no-op while it runs, a restart when it died (sleep/logoff/killed node)
+        $t = @((New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"),
+               (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 2)))
+        $st = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -StartWhenAvailable
         Register-ScheduledTask -TaskName 'ws-proxy' -Action $a -Trigger $t -Settings $st -Force | Out-Null
         Start-ScheduledTask -TaskName 'ws-proxy'
     } catch { Write-Host "  WSLNET: logon task failed ($($_.Exception.Message)); starting the proxy for this session only"
